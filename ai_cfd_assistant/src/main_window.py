@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 import os
+import json
+import numpy as np
 from PySide6.QtCore import Qt, QSize
 from PySide6.QtGui import QAction, QKeySequence, QIcon
 from PySide6.QtWidgets import (
@@ -31,6 +33,10 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.ai_client = AIClient()
+        self.current_airfoil_data = None  # imported/current airfoil points [(x,y), ...]
+        self.current_airfoil_name = "NACA 2412"
+        self.current_result = None  # last PanelMethodResult
+        self.current_alpha = 4.0
         self._setup_window()
         self._setup_menu()
         self._setup_toolbar()
@@ -308,8 +314,13 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage(message)
 
     # --- Menu actions ---
+
     def _on_new(self):
         self.chat_widget.clear_chat()
+        self.current_airfoil_data = None
+        self.current_airfoil_name = "NACA 2412"
+        self.current_result = None
+        self.viz_panel.set_airfoil("2412")
         self._set_status("新项目已创建")
 
     def _on_import_dat(self):
@@ -320,40 +331,116 @@ class MainWindow(QMainWindow):
         if path:
             try:
                 data = _parse_dat(path)
-                self._set_status(f"已导入翼型: {os.path.basename(path)} ({len(data)} 点)")
+                if len(data) < 10:
+                    raise ValueError("数据点太少，至少需要10个点")
+                self.current_airfoil_data = data
+                self.current_airfoil_name = os.path.basename(path)
+                self._update_viz_with_dat(data)
                 self.tree.setCurrentItem(self.geometry_item)
+                self._set_status(f"已导入翼型: {os.path.basename(path)} ({len(data)} 点)")
             except Exception as e:
                 QMessageBox.warning(self, "导入失败", f"无法解析文件: {e}")
 
+    def _update_viz_with_dat(self, data: list):
+        """Update visualization panels with imported DAT airfoil data."""
+        pts = np.array(data)
+        x, y = pts[:, 0], pts[:, 1]
+        # Normalize to chord length
+        x_min, x_max = x.min(), x.max()
+        chord = x_max - x_min
+        if chord < 0.001:
+            return
+        x_norm = (x - x_min) / chord
+        y_norm = y / chord
+        # Mirror y if mostly negative
+        if np.mean(y_norm) < 0:
+            y_norm = -y_norm
+        # Update airfoil panel
+        self.viz_panel.airfoil_panel.set_custom_airfoil(x_norm, y_norm, self.current_airfoil_name)
+        self.viz_panel.pressure_panel.set_custom_airfoil(x_norm, y_norm, self.current_airfoil_name)
+        self.viz_panel.streamline_panel.set_custom_airfoil(x_norm, y_norm, self.current_airfoil_name)
+
+    def _on_save(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "保存项目", "project.cfdproj",
+            "CFD Project (*.cfdproj);;All Files (*)"
+        )
+        if not path:
+            return
+        try:
+            project = {
+                "version": "0.1",
+                "airfoil_name": self.current_airfoil_name,
+                "airfoil_data": self.current_airfoil_data,
+                "alpha": self.current_alpha,
+                "messages": self.chat_widget.messages[-20:] if hasattr(self, 'chat_widget') else [],
+            }
+            if self.current_result is not None:
+                project["result"] = {
+                    "cl": float(self.current_result.cl),
+                    "cpm": float(self.current_result.cpm),
+                    "cp": self.current_result.cp.tolist(),
+                }
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(project, f, ensure_ascii=False, indent=2)
+            self._set_status(f"项目已保存: {path}")
+        except Exception as e:
+            QMessageBox.warning(self, "保存失败", str(e))
+
     def _on_export(self):
+        if self.current_result is None:
+            QMessageBox.information(self, "提示", "请先在求解菜单中运行计算")
+            return
         path, _ = QFileDialog.getSaveFileName(
             self, "导出结果", "results.txt",
             "Text Files (*.txt);;All Files (*)"
         )
-        if path:
-            try:
-                with open(path, 'w', encoding='utf-8') as f:
-                    f.write("近地翼片 2D-CFD 仿真结果\n")
-                    f.write("=" * 40 + "\n")
-                    f.write("翼型: NACA 2412\n")
-                    f.write("导出时间: 2026-06-05\n")
-                self._set_status(f"结果已导出至: {path}")
-            except Exception as e:
-                QMessageBox.warning(self, "导出失败", str(e))
-
-    def _on_save(self):
-        path, _ = QFileDialog.getSaveFileName(
-            self, "保存项目", "project.cfd",
-            "CFD Project (*.cfd);;All Files (*)"
-        )
-        if path:
-            self._set_status(f"项目已保存: {path}")
+        if not path:
+            return
+        try:
+            r = self.current_result
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write("近地翼片 2D-CFD 仿真结果\n")
+                f.write("=" * 60 + "\n")
+                f.write(f"翼型: {self.current_airfoil_name}\n")
+                f.write(f"攻角: {self.current_alpha}°\n")
+                f.write(f"升力系数 Cl: {r.cl:.4f}\n")
+                f.write(f"力矩系数 Cm: {r.cpm:.4f}\n")
+                f.write("-" * 60 + "\n")
+                f.write(f"{'x/c':>10s}  {'y/c':>10s}  {'Cp':>10s}\n")
+                for i in range(len(r.cp)):
+                    f.write(f"{r.x_panel[i]:10.4f}  {r.y_panel[i]:10.4f}  {r.cp[i]:10.4f}\n")
+            self._set_status(f"结果已导出: {path}")
+        except Exception as e:
+            QMessageBox.warning(self, "导出失败", str(e))
 
     def _on_solve(self):
-        self._set_status("正在求解... (面元法计算中)")
-        self.tree.setCurrentItem(self.post_item)
+        self._set_status("正在求解...")
+        try:
+            from .cfd_core import naca4, panel_method, AirfoilResult
+            if self.current_airfoil_data is not None:
+                pts = np.array(self.current_airfoil_data)
+                x, y = pts[:, 0], pts[:, 1]
+                x = (x - x.min()) / (x.max() - x.min() + 1e-12)
+                y = y / (x.max() - x.min() + 1e-12)
+                n = len(x) // 2
+                af = AirfoilResult(
+                    x=x, y=y, xu=x[:n], yu=y[:n],
+                    xl=x[n:], yl=y[n:], camber=np.zeros(n),
+                    naca_code=self.current_airfoil_name,
+                )
+            else:
+                af = naca4("2412", 160)
+            self.current_result = panel_method(af, self.current_alpha, 80)
+            self._set_status(
+                f"求解完成 — Cl={self.current_result.cl:.4f}, Cm={self.current_result.cpm:.4f}"
+            )
+            self.tree.setCurrentItem(self.post_item)
+        except Exception as e:
+            self._set_status(f"求解失败: {e}")
 
     def _on_clear_solve(self):
+        self.current_result = None
         self._set_status("求解结果已清除")
 
     def _on_about(self):

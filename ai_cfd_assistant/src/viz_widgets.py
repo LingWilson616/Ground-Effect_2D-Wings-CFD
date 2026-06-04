@@ -34,6 +34,9 @@ class AirfoilPanel(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._custom_x = None
+        self._custom_y = None
+        self._custom_name = ""
         self._setup_ui()
         self._update_plot()
 
@@ -92,24 +95,49 @@ class AirfoilPanel(QWidget):
             return naca4(code, self.n_points.value())
         return naca4("2412", self.n_points.value())
 
+    def set_custom_airfoil(self, x: np.ndarray, y: np.ndarray, name: str = ""):
+        """Set a custom airfoil from imported DAT data."""
+        self._custom_x = x
+        self._custom_y = y
+        self._custom_name = name
+        self.naca_code.setEnabled(False)
+        self.naca_series.setEnabled(False)
+        self._update_plot()
+
     def _update_plot(self):
-        try:
-            af = self.get_airfoil()
-        except Exception:
-            return
+        is_custom = self._custom_x is not None
+        if is_custom:
+            x, y = self._custom_x, self._custom_y
+            name = self._custom_name
+        else:
+            try:
+                af = self.get_airfoil()
+            except Exception:
+                return
+            xu, yu, xl, yl = af.xu, af.yu, af.xl, af.yl
+            camber = af.camber
+            name = f"NACA {af.naca_code}"
 
         self.canvas.fig.clear()
         ax = self.canvas.fig.add_subplot(111)
         ax.set_facecolor('#0d1117')
 
-        ax.plot(af.xu, af.yu, color='#58a6ff', linewidth=2, label='上表面')
-        ax.plot(af.xl, af.yl, color='#a5d6ff', linewidth=2, label='下表面')
-        ax.plot(af.xu, af.camber, '--', color='#8b949e', linewidth=1, alpha=0.6, label='中弧线')
+        if is_custom:
+            n_half = len(x) // 2
+            ax.plot(x[:n_half], y[:n_half], color='#58a6ff', linewidth=2, label='上表面')
+            ax.plot(x[n_half:], y[n_half:], color='#a5d6ff', linewidth=2, label='下表面')
+            ax.fill(np.concatenate([x[:n_half], x[n_half:][::-1]]),
+                    np.concatenate([y[:n_half], y[n_half:][::-1]]),
+                    color='#58a6ff', alpha=0.15)
+        else:
+            ax.plot(af.xu, af.yu, color='#58a6ff', linewidth=2, label='上表面')
+            ax.plot(af.xl, af.yl, color='#a5d6ff', linewidth=2, label='下表面')
+            ax.plot(af.xu, af.camber, '--', color='#8b949e', linewidth=1, alpha=0.6, label='中弧线')
+            ax.fill(af.x, af.y, color='#58a6ff', alpha=0.15)
 
-        ax.fill(af.x, af.y, color='#58a6ff', alpha=0.15)
         ax.set_xlabel('x/c', color='#8b949e', fontsize=9)
         ax.set_ylabel('y/c', color='#8b949e', fontsize=9)
-        ax.set_title(f'NACA {af.naca_code} 翼型', color='#c9d1d9', fontsize=11, fontweight='bold')
+        ax.set_title(f'{name} 翼型', color='#c9d1d9', fontsize=11, fontweight='bold')
         ax.legend(loc='upper right', facecolor='#161b22', edgecolor='#30363d',
                   labelcolor='#c9d1d9', fontsize=8)
         ax.set_aspect('equal')
@@ -128,6 +156,9 @@ class PressurePanel(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._custom_x = None
+        self._custom_y = None
+        self._custom_name = ""
         self._setup_ui()
         self._update_plot()
 
@@ -175,8 +206,21 @@ class PressurePanel(QWidget):
                 font-size: 11px; text-transform: uppercase; }
         """
 
+    def set_custom_airfoil(self, x: np.ndarray, y: np.ndarray, name: str = ""):
+        self._custom_x = x
+        self._custom_y = y
+        self._custom_name = name
+
     def get_airfoil(self):
-        # Get from the AirfoilPanel... in real app, shared state
+        from .cfd_core import AirfoilResult
+        if self._custom_x is not None:
+            x, y = self._custom_x, self._custom_y
+            n = len(x) // 2
+            return AirfoilResult(
+                x=x, y=y, xu=x[:n], yu=y[:n],
+                xl=x[n:], yl=y[n:], camber=np.zeros(n),
+                naca_code=self._custom_name,
+            )
         return naca4("2412", 160)
 
     def _update_plot(self):
@@ -224,6 +268,9 @@ class StreamlinePanel(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._custom_x = None
+        self._custom_y = None
+        self._custom_name = ""
         self._setup_ui()
         self._update_plot()
 
@@ -265,9 +312,24 @@ class StreamlinePanel(QWidget):
                 font-size: 11px; text-transform: uppercase; }
         """
 
+    def set_custom_airfoil(self, x: np.ndarray, y: np.ndarray, name: str = ""):
+        self._custom_x = x
+        self._custom_y = y
+        self._custom_name = name
+
     def _update_plot(self):
         try:
-            af = naca4("2412", 160)
+            from .cfd_core import AirfoilResult
+            if self._custom_x is not None:
+                x_c, y_c = self._custom_x, self._custom_y
+                n = len(x_c) // 2
+                af = AirfoilResult(
+                    x=x_c, y=y_c, xu=x_c[:n], yu=y_c[:n],
+                    xl=x_c[n:], yl=y_c[n:], camber=np.zeros(n),
+                    naca_code=self._custom_name,
+                )
+            else:
+                af = naca4("2412", 160)
             result = panel_method(af, self.alpha_stream.value(), 80)
             streamlines = compute_streamlines(af, result, self.alpha_stream.value(),
                                               n_streamlines=self.n_stream.value())

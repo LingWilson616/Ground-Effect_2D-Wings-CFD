@@ -8,3 +8,4 @@ build/
 *.exe
 .DS_Store
 Thumbs.db
+.claude/
