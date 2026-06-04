@@ -69,18 +69,21 @@ class InteractiveGeometryCanvas(QWidget):
 
         # Line drawing state
         self._line_start = -1  # index of start point, -1 means waiting
-        self._pending_points = []  # for spline
+        self._pending_indices: list[int] = []  # control point indices for spline in progress
 
         # Tool system
         self._current_tool = GeoTool.SELECT
 
         # Geometry elements
         self.points: list[tuple[float, float]] = []
-        self.lines: list[tuple[int, int]] = []          # (point_index_a, point_index_b)
-        self.splines: list[list[tuple[float, float]]] = []  # interpolated curve points
+        self.lines: list[tuple[int, int]] = []          # (point_idx_a, point_idx_b)
+        self.splines: list[list[int]] = []               # list of point indices (control points)
+        self._airfoil_spline_idx: int = -1              # which spline is the imported airfoil
         self.airfoil_x = None
         self.airfoil_y = None
         self.airfoil_name = ""
+        self.airfoil_cx = 0.0       # center world coords
+        self.airfoil_cy = 0.0
 
         self._grid_base_mm = 100.0
         self._grid_minor_mm = 10.0
@@ -109,7 +112,7 @@ class InteractiveGeometryCanvas(QWidget):
     def set_tool(self, tool: GeoTool):
         self._current_tool = tool
         self._line_start = -1
-        self._pending_points = []
+        self._pending_indices = []
         names = {
             GeoTool.SELECT: "选择 — 点击选中元素 | 长按拖动平移",
             GeoTool.POINT: "点工具 — 点击画布创建点 | 长按拖动平移",
@@ -213,12 +216,12 @@ class InteractiveGeometryCanvas(QWidget):
                     self.points.pop(self._line_start)
                 self._line_start = -1
                 self.status_changed.emit("直线绘制已取消")
-            elif self._pending_points:
-                # Remove pending control points from points list
-                for _ in self._pending_points:
-                    if self.points:
-                        self.points.pop()
-                self._pending_points = []
+            elif self._pending_indices:
+                # Remove the control points that were added (in reverse order)
+                for idx in reversed(self._pending_indices):
+                    if idx < len(self.points):
+                        self.points.pop(idx)
+                self._pending_indices = []
                 self.status_changed.emit("样条线绘制已取消")
             elif self.selected:
                 self.selected.clear()
@@ -270,13 +273,41 @@ class InteractiveGeometryCanvas(QWidget):
                 best_dist = d2
                 best = ('line', i)
 
-        # Check splines (nearest point on curve)
-        for i, curve in enumerate(self.splines):
+        # Check splines (nearest point on interpolated curve)
+        for i, indices in enumerate(self.splines):
+            if len(indices) < 2:
+                continue
+            valid = [j for j in indices if j < len(self.points)]
+            if len(valid) < 2:
+                continue
+            ctrl_pts = [self.points[j] for j in valid]
+            curve = self._catmull_rom_spline(ctrl_pts)
             for cx, cy in curve:
                 d2 = (wx - cx) ** 2 + (wy - cy) ** 2
                 if d2 < threshold2 and d2 < best_dist:
                     best_dist = d2
                     best = ('spline', i)
+
+        # Check airfoil (hi-res display) — hit test against bounding box
+        if self.airfoil_x is not None and self.airfoil_y is not None:
+            # Convert world click to normalized coords
+            scale = 1000.0
+            nx = (wx - self.world_w / 2) / scale + 0.5
+            ny = (wy - self.world_h / 2) / scale
+            # Check if point is near the airfoil surface
+            ax, ay = self.airfoil_x, self.airfoil_y
+            min_d2 = float('inf')
+            for i in range(0, len(ax), max(1, len(ax) // 50)):
+                dx = nx - ax[i]
+                dy = ny - ay[i]
+                d2 = dx * dx + dy * dy
+                if d2 < min_d2:
+                    min_d2 = d2
+            # Convert normalized distance to world distance
+            min_d_world2 = min_d2 * scale * scale
+            if min_d_world2 < threshold2 and min_d_world2 < best_dist:
+                best_dist = min_d_world2
+                best = ('airfoil', 0)
 
         return best
 
@@ -292,7 +323,12 @@ class InteractiveGeometryCanvas(QWidget):
                 if ia < len(self.points) and ib < len(self.points):
                     self._move_original_data.append(('line', idx, ia, ib, self.points[ia], self.points[ib]))
             elif sel_type == 'spline':
-                self._move_original_data.append(('spline', idx, [(p[0], p[1]) for p in self.splines[idx]]))
+                self._move_original_data.append(('spline', idx,
+                    [(i, self.points[i]) for i in self.splines[idx] if i < len(self.points)]))
+            elif sel_type == 'airfoil':
+                x0 = self.airfoil_cx
+                y0 = self.airfoil_cy
+                self._move_original_data.append(('airfoil', idx, x0, y0))
 
     def _apply_move_delta(self, dx: float, dy: float):
         """Apply translation delta to all selected elements."""
@@ -307,25 +343,42 @@ class InteractiveGeometryCanvas(QWidget):
                 self.points[ia] = (orig_a[0] + dx, orig_a[1] + dy)
                 self.points[ib] = (orig_b[0] + dx, orig_b[1] + dy)
             elif sel_type == 'spline':
-                _, _, orig = entry
-                self.splines[idx] = [(px + dx, py + dy) for px, py in orig]
+                _, _, pairs = entry
+                for pt_idx, orig in pairs:
+                    self.points[pt_idx] = (orig[0] + dx, orig[1] + dy)
+                # If this is the airfoil spline, also shift the airfoil center
+                if idx == self._airfoil_spline_idx:
+                    self.airfoil_cx += dx
+                    self.airfoil_cy += dy
+            elif sel_type == 'airfoil':
+                _, _, x0, y0 = entry
+                self.airfoil_cx = x0 + dx
+                self.airfoil_cy = y0 + dy
+                # Also shift the control points of the airfoil spline
+                sidx = self._airfoil_spline_idx
+                if sidx >= 0 and sidx < len(self.splines):
+                    for pi in self.splines[sidx]:
+                        if pi < len(self.points):
+                            px, py = self.points[pi]
+                            self.points[pi] = (px + dx, py + dy)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent):
         if event.button() == Qt.LeftButton and self._current_tool == GeoTool.SPLINE:
-            # First click of the double-click already added a point via mouseReleaseEvent.
-            # Remove that extra point, then finish the spline with the remaining points.
-            if self._pending_points:
-                self._pending_points.pop()
-            if len(self._pending_points) >= 2:
-                curve = self._catmull_rom_spline(self._pending_points)
-                self.splines.append(curve)
+            # First click of double-click already added a point via mouseReleaseEvent.
+            # Remove that extra point, then finish with remaining control points.
+            if self._pending_indices:
+                extra_idx = self._pending_indices.pop()
+                if extra_idx < len(self.points):
+                    self.points.pop(extra_idx)
+            if len(self._pending_indices) >= 2:
+                self.splines.append(list(self._pending_indices))
                 self.status_changed.emit(
-                    f"样条线完成: {len(self._pending_points)} 个控制点 → {len(curve)} 个插值点"
+                    f"样条线完成: {len(self._pending_indices)} 个控制点"
                 )
-                self._pending_points = []
-                self._spline_finished = True  # block the trailing release event
+                self._pending_indices = []
+                self._spline_finished = True
             else:
-                self.status_changed.emit("样条线至少需要2个点，请继续点击添加控制点")
+                self.status_changed.emit("样条线至少需要2个控制点，请继续点击")
             self.update()
 
     @staticmethod
@@ -394,7 +447,10 @@ class InteractiveGeometryCanvas(QWidget):
                     elif sel_type == 'line':
                         self.status_changed.emit(f"选中: 直线 #{idx+1}")
                     elif sel_type == 'spline':
-                        self.status_changed.emit(f"选中: 样条线 #{idx+1}")
+                        n_ctrl = len(self.splines[idx])
+                        self.status_changed.emit(f"选中: 样条线 #{idx+1} ({n_ctrl} 控制点)")
+                    elif sel_type == 'airfoil':
+                        self.status_changed.emit(f"选中: 翼型 {self.airfoil_name}")
             else:
                 self.selected.clear()
                 self.status_changed.emit("取消选中")
@@ -428,21 +484,33 @@ class InteractiveGeometryCanvas(QWidget):
                 )
                 self._line_start = -1
         elif tool == GeoTool.SPLINE:
-            self._pending_points.append((wx, wy))
+            idx = len(self.points)
             self.points.append((wx, wy))
-            n = len(self._pending_points)
+            self._pending_indices.append(idx)
+            n = len(self._pending_indices)
             self.status_changed.emit(f"样条线控制点 {n}: ({wx:.1f}, {wy:.1f}) — 继续点击，双击完成")
         elif tool == GeoTool.DELETE:
             if self.points:
                 removed_idx = len(self.points) - 1
                 removed = self.points.pop()
-                # Remove lines that reference the deleted point
+                # Remove/downgrade lines that reference the deleted point
                 self.lines = [(a, b) for a, b in self.lines
                               if a != removed_idx and b != removed_idx]
-                # Re-index lines (decrement indices > removed_idx)
                 self.lines = [(a - 1 if a > removed_idx else a,
                                b - 1 if b > removed_idx else b)
                               for a, b in self.lines]
+                # Remove/downgrade splines that reference the deleted point
+                new_splines = []
+                for indices in self.splines:
+                    cleaned = [i for i in indices if i != removed_idx]
+                    if len(cleaned) >= 2:
+                        cleaned = [i - 1 if i > removed_idx else i for i in cleaned]
+                        new_splines.append(cleaned)
+                self.splines = new_splines
+                # Fix _pending_indices
+                if self._pending_indices:
+                    self._pending_indices = [i for i in self._pending_indices if i != removed_idx]
+                    self._pending_indices = [i - 1 if i > removed_idx else i for i in self._pending_indices]
                 self.status_changed.emit(f"已删除点: ({removed[0]:.1f}, {removed[1]:.1f})")
             elif self.lines:
                 removed = self.lines.pop()
@@ -450,9 +518,9 @@ class InteractiveGeometryCanvas(QWidget):
             elif self.splines:
                 removed = self.splines.pop()
                 self.status_changed.emit(f"已删除样条线 ({len(removed)} 个插值点)")
-            elif self._pending_points:
-                self._pending_points.pop()
-                n = len(self._pending_points)
+            elif self._pending_indices:
+                self._pending_indices.pop()
+                n = len(self._pending_indices)
                 self.status_changed.emit(f"已删除控制点，剩余 {n}" + (" 个 — 双击完成" if n > 0 else " 个，已取消"))
             else:
                 self.status_changed.emit("没有可删除的元素")
@@ -720,7 +788,8 @@ class InteractiveGeometryCanvas(QWidget):
 
         # Scale to fit center of canvas (chord ~1000mm)
         scale = 1000.0
-        cx, cy = self.world_w / 2, self.world_h / 2
+        cx = self.airfoil_cx if self.airfoil_cx != 0 else self.world_w / 2
+        cy = self.airfoil_cy if self.airfoil_cy != 0 else self.world_h / 2
 
         first = True
         for i in range(len(x)):
@@ -787,8 +856,15 @@ class InteractiveGeometryCanvas(QWidget):
             px2, py2 = self._world_to_widget(x2, y2)
             p.drawLine(int(px1), int(py1), int(px2), int(py2))
 
-        # Completed splines
-        for i, curve in enumerate(self.splines):
+        # Completed splines — computed from control point indices
+        for i, indices in enumerate(self.splines):
+            if len(indices) < 2:
+                continue
+            valid = [j for j in indices if j < len(self.points)]
+            if len(valid) < 2:
+                continue
+            ctrl = [self.points[j] for j in valid]
+            curve = self._catmull_rom_spline(ctrl)
             is_sel = ('spline', i) in sel_set
             pen = highlight_pen if is_sel else QPen(QColor(31, 111, 235), 2.5 if is_sel else 2)
             p.setPen(pen)
@@ -798,19 +874,21 @@ class InteractiveGeometryCanvas(QWidget):
                 px2, py2 = self._world_to_widget(*curve[j + 1])
                 p.drawLine(int(px1), int(py1), int(px2), int(py2))
 
-        # Pending spline control points + preview polyline
-        if self._pending_points:
+        # Pending spline preview — control points + dashed polyline
+        if self._pending_indices:
+            valid_pending = [j for j in self._pending_indices if j < len(self.points)]
+            pending_ctrl = [self.points[j] for j in valid_pending]
             # Preview polyline connecting control points
             p.setPen(QPen(QColor(31, 111, 235, 120), 1.2, Qt.DashLine))
-            for i in range(len(self._pending_points) - 1):
-                px1, py1 = self._world_to_widget(*self._pending_points[i])
-                px2, py2 = self._world_to_widget(*self._pending_points[i + 1])
+            for k in range(len(pending_ctrl) - 1):
+                px1, py1 = self._world_to_widget(*pending_ctrl[k])
+                px2, py2 = self._world_to_widget(*pending_ctrl[k + 1])
                 p.drawLine(int(px1), int(py1), int(px2), int(py2))
 
             # Control point markers
             p.setBrush(QBrush(QColor(31, 111, 235)))
             p.setPen(Qt.NoPen)
-            for wx, wy in self._pending_points:
+            for wx, wy in pending_ctrl:
                 px, py = self._world_to_widget(wx, wy)
                 p.drawEllipse(QPointF(px, py), radius + 1, radius + 1)
 
@@ -824,30 +902,38 @@ class InteractiveGeometryCanvas(QWidget):
 
     # ===== Public API =====
 
-    def set_airfoil(self, x: np.ndarray, y: np.ndarray, name: str = ""):
-        """Display an airfoil on the canvas."""
+    def set_airfoil(self, x: np.ndarray, y: np.ndarray, name: str = "", spline_idx: int = -1, cx: float = 0, cy: float = 0):
+        """Display an airfoil on the canvas. spline_idx tracks which spline is the airfoil."""
         self.airfoil_x = x.copy()
         self.airfoil_y = y.copy()
         self.airfoil_name = name
+        self._airfoil_spline_idx = spline_idx
+        self.airfoil_cx = cx
+        self.airfoil_cy = cy
         if not self._initial_fit_done:
             self._fit_to_widget()
             self._initial_fit_done = True
         self.update()
 
     def clear_airfoil(self):
+        if self._airfoil_spline_idx >= 0 and self._airfoil_spline_idx < len(self.splines):
+            self.splines.pop(self._airfoil_spline_idx)
+            self._airfoil_spline_idx = -1
         self.airfoil_x = None
         self.airfoil_y = None
         self.airfoil_name = ""
+        self.airfoil_cx = 0.0
+        self.airfoil_cy = 0.0
         self.update()
 
     def clear_all(self):
+        self.clear_airfoil()
         self.points.clear()
         self.lines.clear()
         self.splines.clear()
-        self._pending_points = []
+        self._pending_indices = []
         self.selected.clear()
         self._moving = False
-        self.clear_airfoil()
         self.update()
 
     def add_point(self, wx: float, wy: float):
@@ -884,10 +970,20 @@ class InteractiveGeometryCanvas(QWidget):
         self.lines = [(survivor_idx if a == removed_idx else a,
                         survivor_idx if b == removed_idx else b)
                        for a, b in self.lines]
-        # Re-index: decrement indices > removed_idx
+        # Replace spline references
+        for spl in self.splines:
+            for k in range(len(spl)):
+                if spl[k] == removed_idx:
+                    spl[k] = survivor_idx
+        # Re-index lines
         self.lines = [(a - 1 if a > removed_idx else a,
                         b - 1 if b > removed_idx else b)
                       for a, b in self.lines]
+        # Re-index splines
+        for spl in self.splines:
+            for k in range(len(spl)):
+                if spl[k] > removed_idx:
+                    spl[k] -= 1
         self.selected.clear()
         self.status_changed.emit(
             f"重合约束: 点#{removed_idx+1} → 点#{survivor_idx+1} ({target[0]:.1f}, {target[1]:.1f})"

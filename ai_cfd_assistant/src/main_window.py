@@ -16,6 +16,8 @@ from .chat_widget import ChatWidget
 from .viz_widgets import VizPanel
 from .geometry_canvas import InteractiveGeometryCanvas
 from .region_canvas import RegionCanvas
+from .post_process import PostProcessPanel
+from .mesh_workspace import MeshWorkspace
 from .ai_client import AIClient
 from .theme import QSS
 
@@ -247,25 +249,13 @@ class MainWindow(QMainWindow):
         region_layout.addWidget(self.region_canvas, stretch=1)
         self.workspace.addWidget(self.region_workspace)
 
-        # Mesh workspace
-        self.mesh_workspace = QWidget()
-        mesh_layout = QVBoxLayout(self.mesh_workspace)
-        mesh_layout.setContentsMargins(0, 0, 0, 0)
-        mesh_label = QLabel("网格生成\n\n基础尺寸: 100mm | 最小尺寸: 0.1mm\n\n点击菜单栏 [求解] → [开始求解] 生成网格并计算")
-        mesh_label.setAlignment(Qt.AlignCenter)
-        mesh_label.setStyleSheet("background-color: #161b22; color: #8b949e; font-size: 14px; margin: 8px; border-radius: 4px;")
-        mesh_layout.addWidget(mesh_label)
+        # Mesh workspace — O-grid generator
+        self.mesh_workspace = MeshWorkspace()
         self.workspace.addWidget(self.mesh_workspace)
 
-        # Post-processing workspace
-        self.post_workspace = QWidget()
-        post_layout = QVBoxLayout(self.post_workspace)
-        post_layout.setContentsMargins(0, 0, 0, 0)
-        post_label = QLabel("后处理结果\n\n压力系数云图 | 总压系数云图 | 速度曲线卷积分\n下压力计算\n\n请先在菜单栏点击 [求解] → [开始求解]")
-        post_label.setAlignment(Qt.AlignCenter)
-        post_label.setStyleSheet("background-color: #161b22; color: #8b949e; font-size: 14px; margin: 8px; border-radius: 4px;")
-        post_layout.addWidget(post_label)
-        self.workspace.addWidget(self.post_workspace)
+        # Post-processing workspace — real results display
+        self.post_panel = PostProcessPanel()
+        self.workspace.addWidget(self.post_panel)
 
         # AI workspace (chat + viz)
         self.ai_workspace = QWidget()
@@ -343,7 +333,7 @@ class MainWindow(QMainWindow):
             self.toolbar.hide()
             self._set_status("网格模块 — 配置网格参数")
         elif node_type == "post":
-            self.workspace.setCurrentWidget(self.post_workspace)
+            self.workspace.setCurrentWidget(self.post_panel)
             self.toolbar.hide()
             self._set_status("后处理模块 — 查看计算结果")
         elif node_type == "ai":
@@ -374,6 +364,7 @@ class MainWindow(QMainWindow):
         self.current_airfoil_name = "NACA 2412"
         self.current_result = None
         self.geo_canvas.clear_all()
+        self.post_panel.clear()
         self.viz_panel.set_airfoil("2412")
         self._set_status("新项目已创建")
 
@@ -396,27 +387,46 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "导入失败", f"无法解析文件: {e}")
 
     def _update_viz_with_dat(self, data: list):
-        """Update visualization panels with imported DAT airfoil data."""
+        """Update all displays with imported DAT airfoil data."""
         pts = np.array(data)
         x, y = pts[:, 0], pts[:, 1]
-        # Normalize to chord length
         x_min, x_max = x.min(), x.max()
         chord = x_max - x_min
         if chord < 0.001:
             return
         x_norm = (x - x_min) / chord
         y_norm = y / chord
-        # Mirror y if mostly negative
         if np.mean(y_norm) < 0:
             y_norm = -y_norm
-        # Update geometry canvas
-        self.geo_canvas.set_airfoil(x_norm, y_norm, self.current_airfoil_name)
-        # Update region canvas
+
+        canvas = self.geo_canvas
+        canvas.clear_all()
+        canvas.airfoil_x = x_norm
+        canvas.airfoil_y = y_norm
+        canvas.airfoil_name = self.current_airfoil_name
+
+        # Downsample to ~40 selectable control points on the canvas
+        total = len(x_norm)
+        n_ctrl = min(total, 40)
+        indices = np.linspace(0, total - 1, n_ctrl, dtype=int)
+        scale = 1000.0
+        cwx, cwy = canvas.world_w / 2, canvas.world_h / 2
+        wxs = [(x_norm[i] - 0.5) * scale + cwx for i in indices]
+        wys = [y_norm[i] * scale + cwy for i in indices]
+        start_idx = len(canvas.points)
+        for wx, wy in zip(wxs, wys):
+            canvas.points.append((float(wx), float(wy)))
+        canvas.splines.append(list(range(start_idx, len(canvas.points))))
+        canvas._airfoil_spline_idx = len(canvas.splines) - 1
+        canvas.airfoil_cx = cwx
+        canvas.airfoil_cy = cwy
+
         self.region_canvas.set_airfoil(x_norm, y_norm, self.current_airfoil_name)
-        # Update viz panels
+        self.mesh_workspace.set_airfoil(x_norm, y_norm)
         self.viz_panel.airfoil_panel.set_custom_airfoil(x_norm, y_norm, self.current_airfoil_name)
         self.viz_panel.pressure_panel.set_custom_airfoil(x_norm, y_norm, self.current_airfoil_name)
         self.viz_panel.streamline_panel.set_custom_airfoil(x_norm, y_norm, self.current_airfoil_name)
+        canvas.update()
 
     def _on_save(self):
         path, _ = QFileDialog.getSaveFileName(
@@ -479,26 +489,37 @@ class MainWindow(QMainWindow):
             if self.current_airfoil_data is not None:
                 pts = np.array(self.current_airfoil_data)
                 x, y = pts[:, 0], pts[:, 1]
-                x = (x - x.min()) / (x.max() - x.min() + 1e-12)
-                y = y / (x.max() - x.min() + 1e-12)
-                n = len(x) // 2
+                chord = x.max() - x.min()
+                if chord < 0.001:
+                    chord = 1.0
+                x_n = (x - x.min()) / chord
+                y_n = y / chord
+                if np.mean(y_n) < 0:
+                    y_n = -y_n
+                n = len(x_n) // 2
                 af = AirfoilResult(
-                    x=x, y=y, xu=x[:n], yu=y[:n],
-                    xl=x[n:], yl=y[n:], camber=np.zeros(n),
-                    naca_code=self.current_airfoil_name,
+                    x=x_n, y=y_n,
+                    xu=x_n[:n], yu=y_n[:n],
+                    xl=x_n[n:], yl=y_n[n:],
+                    camber=np.zeros(n), naca_code=self.current_airfoil_name,
                 )
             else:
                 af = naca4("2412", 160)
+                self.current_airfoil_name = "NACA 2412"
             self.current_result = panel_method(af, self.current_alpha, 80)
+            self.post_panel.set_result(self.current_result, af, self.current_alpha)
             self._set_status(
                 f"求解完成 — Cl={self.current_result.cl:.4f}, Cm={self.current_result.cpm:.4f}"
             )
             self.tree.setCurrentItem(self.post_item)
         except Exception as e:
             self._set_status(f"求解失败: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _on_clear_solve(self):
         self.current_result = None
+        self.post_panel.clear()
         self._set_status("求解结果已清除")
 
     def _on_about(self):
