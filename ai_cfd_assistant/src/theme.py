@@ -63,8 +63,11 @@ QToolBar QToolButton {
 QToolBar QToolButton:hover {
     background-color: #21262d;
 }
-QToolBar QToolButton:pressed {
-    background-color: #30363d;
+QToolBar QToolButton:checked {
+    background-color: #1f6feb;
+    color: #ffffff;
+    border-radius: 6px;
+    border: 1px solid #388bfd;
 }
 
 /* ===== Status Bar ===== */

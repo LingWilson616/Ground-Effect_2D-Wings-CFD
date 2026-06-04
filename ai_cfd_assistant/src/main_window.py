@@ -115,24 +115,40 @@ class MainWindow(QMainWindow):
         self.toolbar.setIconSize(QSize(20, 20))
         self.addToolBar(Qt.TopToolBarArea, self.toolbar)
 
-        # Geometry creation tools
-        self.toolbar.addAction("📌 点", lambda: self._set_geo_tool(GeoTool.POINT))
-        self.toolbar.addAction("📏 直线", lambda: self._set_geo_tool(GeoTool.LINE))
-        self.toolbar.addAction("〰️ 样条线", lambda: self._set_geo_tool(GeoTool.SPLINE))
+        self._geo_tool_actions = {}
+        self._geo_tool_group = None  # QActionGroup for exclusive selection
+
+        def make_action(text, tool):
+            a = self.toolbar.addAction(text)
+            a.setCheckable(True)
+            a.triggered.connect(lambda: self._set_geo_tool(tool))
+            self._geo_tool_actions[tool] = a
+            return a
+
+        make_action("📌 点", GeoTool.POINT)
+        make_action("📏 直线", GeoTool.LINE)
+        make_action("〰️ 样条线", GeoTool.SPLINE)
         self.toolbar.addSeparator()
-        self.toolbar.addAction("➕ 创建", lambda: self._set_geo_tool(GeoTool.CREATE))
-        self.toolbar.addAction("🗑 删除", lambda: self._set_geo_tool(GeoTool.DELETE))
-        self.toolbar.addAction("↔ 移动", lambda: self._set_geo_tool(GeoTool.MOVE))
-        self.toolbar.addAction("🔍 选择", lambda: self._set_geo_tool(GeoTool.SELECT))
+        make_action("➕ 创建", GeoTool.CREATE)
+        make_action("🗑 删除", GeoTool.DELETE)
+        make_action("↔ 移动", GeoTool.MOVE)
+        make_action("🔍 选择", GeoTool.SELECT)
         self.toolbar.addSeparator()
-        self.toolbar.addAction("🔗 重合约束", lambda: self._set_status("约束: 重合 (待实现)"))
-        self.toolbar.addAction("🔒 固联约束", lambda: self._set_status("约束: 固联 (待实现)"))
+        cons1 = self.toolbar.addAction("🔗 重合约束")
+        cons1.setCheckable(True)
+        cons2 = self.toolbar.addAction("🔒 固联约束")
+        cons2.setCheckable(True)
+        cons1.triggered.connect(lambda: self._set_status("约束: 重合 (待实现)"))
+        cons2.triggered.connect(lambda: self._set_status("约束: 固联 (待实现)"))
 
         self.toolbar.hide()
 
     def _set_geo_tool(self, tool):
         if hasattr(self, 'geo_canvas'):
             self.geo_canvas.set_tool(tool)
+        # Uncheck all tool actions, then check the active one
+        for t, a in self._geo_tool_actions.items():
+            a.setChecked(t == tool)
 
     def _setup_central(self):
         central = QWidget()
@@ -193,7 +209,7 @@ class MainWindow(QMainWindow):
         geo_layout.setContentsMargins(0, 0, 0, 0)
         geo_layout.setSpacing(0)
 
-        self.geo_toolbar_label = QLabel("左键拖动平移 | 滚轮缩放 | 右键点击创建点 | 上方工具栏选择工具")
+        self.geo_toolbar_label = QLabel("点击画布操作 | 长按拖动平移 | 滚轮缩放 | 中键重置视图")
         self.geo_toolbar_label.setStyleSheet(
             "color: #8b949e; font-size: 11px; padding: 6px 12px; background: #161b22; border-bottom: 1px solid #30363d;"
         )

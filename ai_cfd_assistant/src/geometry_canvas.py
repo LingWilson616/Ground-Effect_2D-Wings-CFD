@@ -55,6 +55,9 @@ class InteractiveGeometryCanvas(QWidget):
         self._pan_start_y = 0
         self._pan_start_offset_x = 0.0
         self._pan_start_offset_y = 0.0
+        self._drag_threshold = 5  # pixels — beyond this, it's a pan, not a click
+        self._mouse_press_pos = None
+        self._released_without_drag = False
 
         # Line drawing state
         self._line_start = None  # waiting for second point
@@ -97,12 +100,12 @@ class InteractiveGeometryCanvas(QWidget):
         self._line_start = None
         self._pending_points = []
         names = {
-            GeoTool.SELECT: "选择/平移 — 左键拖动平移，右键创建点",
-            GeoTool.POINT: "点工具 — 右键点击画布创建点",
-            GeoTool.LINE: "直线工具 — 右键点击两点创建直线 (Esc 取消)",
-            GeoTool.SPLINE: "样条线 — 右键点击多个点，双击完成",
-            GeoTool.CREATE: "创建 — 右键点击创建几何元素",
-            GeoTool.DELETE: "删除 — 点击删除最近的几何元素",
+            GeoTool.SELECT: "选择/平移 — 点击操作 | 长按拖动平移 | 滚轮缩放",
+            GeoTool.POINT: "点工具 — 点击画布创建点 | 长按拖动平移",
+            GeoTool.LINE: "直线工具 — 点击两点创建直线 | 长按拖动平移",
+            GeoTool.SPLINE: "样条线 — 点击多点，双击完成 | 长按拖动平移",
+            GeoTool.CREATE: "创建 — 点击创建几何元素 | 长按拖动平移",
+            GeoTool.DELETE: "删除 — 点击删除最近元素 | 长按拖动平移",
             GeoTool.MOVE: "移动 — 拖动几何元素",
         }
         self.status_changed.emit(names.get(tool, ""))
@@ -143,51 +146,48 @@ class InteractiveGeometryCanvas(QWidget):
             self._initial_fit_done = True
 
     def mousePressEvent(self, event: QMouseEvent):
-        wx, wy = self._widget_to_world(event.position().x(), event.position().y())
-        in_bounds = 0 <= wx <= self.world_w and 0 <= wy <= self.world_h
+        self._mouse_press_pos = event.position()
+        self._released_without_drag = False
 
         if event.button() == Qt.LeftButton:
-            # Left button always pans (or moves in MOVE tool)
-            self._panning = True
+            # Start potential pan — will become click if released without moving
             self._pan_start_x = event.position().x()
             self._pan_start_y = event.position().y()
             self._pan_start_offset_x = self._offset_x
             self._pan_start_offset_y = self._offset_y
-            self.setCursor(Qt.ClosedHandCursor)
-
-        elif event.button() == Qt.RightButton:
-            if not in_bounds:
-                return
-            tool = self._current_tool
-            if tool == GeoTool.SELECT or tool == GeoTool.POINT or tool == GeoTool.CREATE:
-                self.points.append((wx, wy))
-                self.point_created.emit(wx, wy)
-            elif tool == GeoTool.LINE:
-                if self._line_start is None:
-                    self._line_start = (wx, wy)
-                    self.status_changed.emit(f"直线起点: ({wx:.1f}, {wy:.1f}) — 右键点击终点")
-                else:
-                    self.lines.append((self._line_start, (wx, wy)))
-                    self.status_changed.emit(f"直线: ({self._line_start[0]:.1f},{self._line_start[1]:.1f}) → ({wx:.1f},{wy:.1f})")
-                    self._line_start = None
-            elif tool == GeoTool.SPLINE:
-                self._pending_points.append((wx, wy))
-                self.status_changed.emit(f"样条线点 {len(self._pending_points)}: ({wx:.1f}, {wy:.1f}) — 右键继续，双击完成")
-            elif tool == GeoTool.DELETE:
-                if self.points:
-                    removed = self.points.pop()
-                    self.status_changed.emit(f"已删除点: ({removed[0]:.1f}, {removed[1]:.1f})")
-                elif self.lines:
-                    removed = self.lines.pop()
-                    self.status_changed.emit("已删除最近一条直线")
-            self.update()
 
         elif event.button() == Qt.MiddleButton:
             self._fit_to_widget()
             self.status_changed.emit("视图已重置")
 
+    def mouseMoveEvent(self, event: QMouseEvent):
+        if event.buttons() & Qt.LeftButton:
+            dx = event.position().x() - self._pan_start_x
+            dy = event.position().y() - self._pan_start_y
+            if abs(dx) > self._drag_threshold or abs(dy) > self._drag_threshold:
+                if not self._panning:
+                    self._panning = True
+                    self.setCursor(Qt.ClosedHandCursor)
+                self._offset_x = self._pan_start_offset_x + dx
+                self._offset_y = self._pan_start_offset_y - dy
+                self._clamp_view()
+                self.update()
+        wx, wy = self._widget_to_world(event.position().x(), event.position().y())
+        self.mouse_moved.emit(wx, wy)
+        if self._line_start is not None:
+            self.update()
+
+    def mouseReleaseEvent(self, event: QMouseEvent):
+        if event.button() == Qt.LeftButton:
+            if not self._panning:
+                # Was a click (no drag) — execute tool action
+                self._released_without_drag = True
+                self._execute_tool_action(event.position().x(), event.position().y())
+            self._panning = False
+            self.setCursor(Qt.ArrowCursor)
+
     def mouseDoubleClickEvent(self, event: QMouseEvent):
-        if event.button() == Qt.RightButton and self._current_tool == GeoTool.SPLINE:
+        if event.button() == Qt.LeftButton and self._current_tool == GeoTool.SPLINE:
             if len(self._pending_points) >= 2:
                 self.status_changed.emit(f"样条线完成: {len(self._pending_points)} 个控制点")
                 self._pending_points = []
@@ -195,23 +195,43 @@ class InteractiveGeometryCanvas(QWidget):
                 self.status_changed.emit("样条线至少需要2个点")
             self.update()
 
-    def mouseMoveEvent(self, event: QMouseEvent):
-        if self._panning:
-            dx = event.position().x() - self._pan_start_x
-            dy = event.position().y() - self._pan_start_y
-            self._offset_x = self._pan_start_offset_x + dx
-            self._offset_y = self._pan_start_offset_y - dy
-            self._clamp_view()
-            self.update()
-        wx, wy = self._widget_to_world(event.position().x(), event.position().y())
-        self.mouse_moved.emit(wx, wy)
-        if self._line_start is not None:
-            self.update()
+    def _execute_tool_action(self, px: float, py: float):
+        """Perform the current tool's action at the given widget pixel position."""
+        wx, wy = self._widget_to_world(px, py)
+        in_bounds = 0 <= wx <= self.world_w and 0 <= wy <= self.world_h
+        if not in_bounds:
+            self.status_changed.emit("点击位置超出幕布范围")
+            return
 
-    def mouseReleaseEvent(self, event: QMouseEvent):
-        if event.button() == Qt.LeftButton and self._panning:
-            self._panning = False
-            self.setCursor(Qt.ArrowCursor)
+        tool = self._current_tool
+        if tool == GeoTool.SELECT or tool == GeoTool.POINT or tool == GeoTool.CREATE:
+            self.points.append((wx, wy))
+            self.point_created.emit(wx, wy)
+            self.status_changed.emit(f"创建点: ({wx:.1f}, {wy:.1f}) mm")
+        elif tool == GeoTool.LINE:
+            if self._line_start is None:
+                self._line_start = (wx, wy)
+                self.status_changed.emit(f"直线起点: ({wx:.1f}, {wy:.1f}) — 点击终点")
+            else:
+                self.lines.append((self._line_start, (wx, wy)))
+                self.status_changed.emit(
+                    f"直线: ({self._line_start[0]:.1f},{self._line_start[1]:.1f}) → ({wx:.1f},{wy:.1f})"
+                )
+                self._line_start = None
+        elif tool == GeoTool.SPLINE:
+            self._pending_points.append((wx, wy))
+            n = len(self._pending_points)
+            self.status_changed.emit(f"样条线控制点 {n}: ({wx:.1f}, {wy:.1f}) — 继续点击，双击完成")
+        elif tool == GeoTool.DELETE:
+            if self.points:
+                removed = self.points.pop()
+                self.status_changed.emit(f"已删除点: ({removed[0]:.1f}, {removed[1]:.1f})")
+            elif self.lines:
+                removed = self.lines.pop()
+                self.status_changed.emit("已删除最近一条直线")
+            else:
+                self.status_changed.emit("没有可删除的元素")
+        self.update()
 
     def wheelEvent(self, event: QWheelEvent):
         """Zoom centered on mouse, clamped."""
@@ -298,125 +318,173 @@ class InteractiveGeometryCanvas(QWidget):
             GeoTool.MOVE: "移动",
         }
         name = tool_names.get(self._current_tool, "")
-        p.drawText(self.width() - 160, self.height() - 12, f"工具: {name} | 右键操作")
+        p.drawText(self.width() - 200, self.height() - 12, f"工具: {name} | 点击操作 | 长按平移")
 
     def _draw_background(self, p: QPainter):
-        p.fillRect(self.rect(), self._bg_color)
+        """Fill widget background and draw canvas border rectangle."""
+        # Widget background (outside canvas)
+        p.fillRect(self.rect(), QColor(200, 200, 200))
+
+        # Canvas area (light gray)
+        left, top = self._world_to_widget(0, self.world_h)
+        right, bottom = self._world_to_widget(self.world_w, 0)
+        canvas_rect_x = min(left, right)
+        canvas_rect_y = min(top, bottom)
+        canvas_rect_w = abs(right - left)
+        canvas_rect_h = abs(bottom - top)
+        p.fillRect(int(canvas_rect_x), int(canvas_rect_y), int(canvas_rect_w), int(canvas_rect_h), self._bg_color)
+
+        # Canvas border (bold)
+        pen = QPen(QColor(130, 130, 130), 2.5)
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+        p.drawRect(int(canvas_rect_x), int(canvas_rect_y), int(canvas_rect_w), int(canvas_rect_h))
 
     def _draw_grid(self, p: QPainter):
-        """Draw adaptive grid — show finer grid when zoomed in."""
-        w, h = self.width(), self.height()
+        """Draw double-level grid: minor (10mm) + major (100mm), clipped to canvas."""
 
-        # Choose grid spacing based on zoom
-        px_per_100mm = 100 * self._scale
-        if px_per_100mm > 80:
-            step = self._grid_minor_mm  # 10mm
-            pen = QPen(self._grid_minor, 0.3)
-        elif px_per_100mm > 30:
-            step = self._grid_minor_mm
-            pen = QPen(self._grid_minor, 0.3)
-        else:
-            step = self._grid_base_mm
-            pen = QPen(self._grid_major, 0.5)
+        # Canvas pixel bounds
+        x0_px, _ = self._world_to_widget(0, 0)
+        x1_px, _ = self._world_to_widget(self.world_w, 0)
+        _, y0_px = self._world_to_widget(0, 0)
+        _, y1_px = self._world_to_widget(0, self.world_h)
 
-        p.setPen(pen)
+        c_left = min(x0_px, x1_px)
+        c_right = max(x0_px, x1_px)
+        c_top = min(y0_px, y1_px)
+        c_bottom = max(y0_px, y1_px)
 
-        # Vertical lines
-        x0 = 0
-        while True:
-            px, _ = self._world_to_widget(x0, 0)
-            if px > w:
-                break
-            if px >= 0:
-                p.drawLine(int(px), 0, int(px), h)
-            x0 += step
-        x0 = -step
-        while True:
-            px, _ = self._world_to_widget(x0, 0)
-            if px < 0:
-                break
-            if px <= w:
-                p.drawLine(int(px), 0, int(px), h)
-            x0 -= step
+        px_per_10mm = 10 * self._scale
 
-        # Horizontal lines
-        y0 = 0
-        while True:
-            _, py = self._world_to_widget(0, y0)
-            if py < 0:
-                break
-            if py <= h:
-                p.drawLine(0, int(py), w, int(py))
-            y0 += step
-        y0 = -step
-        while True:
-            _, py = self._world_to_widget(0, y0)
-            if py > h:
-                break
-            if py >= 0:
-                p.drawLine(0, int(py), w, int(py))
-            y0 -= step
+        # Minor grid (10mm) — only if visible
+        if px_per_10mm > 3:
+            pen_minor = QPen(QColor(215, 215, 215), 0.3)
+            p.setPen(pen_minor)
+            wx = 0.0
+            while wx <= self.world_w + 1e-6:
+                px, _ = self._world_to_widget(wx, 0)
+                if c_left <= int(px) <= c_right:
+                    p.drawLine(int(px), int(c_top), int(px), int(c_bottom))
+                wx += 10.0
+            wy = 0.0
+            while wy <= self.world_h + 1e-6:
+                _, py = self._world_to_widget(0, wy)
+                if c_top <= int(py) <= c_bottom:
+                    p.drawLine(int(c_left), int(py), int(c_right), int(py))
+                wy += 10.0
+
+        # Major grid (100mm) — always visible
+        pen_major = QPen(QColor(185, 185, 185), 0.7)
+        p.setPen(pen_major)
+        wx = 0.0
+        while wx <= self.world_w + 1e-6:
+            px, _ = self._world_to_widget(wx, 0)
+            if c_left <= int(px) <= c_right:
+                p.drawLine(int(px), int(c_top), int(px), int(c_bottom))
+            wx += 100.0
+        wy = 0.0
+        while wy <= self.world_h + 1e-6:
+            _, py = self._world_to_widget(0, wy)
+            if c_top <= int(py) <= c_bottom:
+                p.drawLine(int(c_left), int(py), int(c_right), int(py))
+            wy += 100.0
 
     def _draw_axes(self, p: QPainter):
-        """Draw XY axes spanning visible area with tick marks."""
-        w, h = self.width(), self.height()
-        wx_min, wy_min = self._widget_to_world(0, h)
-        wx_max, wy_max = self._widget_to_world(w, 0)
+        """Draw XY axes along canvas edges (left edge = Y, bottom edge = X)."""
+        # Pixel positions of canvas edges
+        x0, y0 = self._world_to_widget(0, 0)           # origin (bottom-left)
+        x1, y1 = self._world_to_widget(self.world_w, 0) # bottom-right
+        _, y_top = self._world_to_widget(0, self.world_h) # top-left
 
-        # X axis at y=0 (if visible)
-        if wy_min <= 0 <= wy_max:
-            px_start, py_y0 = self._world_to_widget(max(0, wx_min), 0)
-            px_end, _ = self._world_to_widget(min(self.world_w, wx_max), 0)
-            p.setPen(QPen(self._axis_color, 1.5))
-            p.drawLine(int(px_start), int(py_y0), int(px_end), int(py_y0))
-            p.drawLine(int(px_end), int(py_y0), int(px_end - 10), int(py_y0 - 4))
-            p.drawLine(int(px_end), int(py_y0), int(px_end - 10), int(py_y0 + 4))
-            font = QFont("Segoe UI", 11, QFont.Bold)
-            p.setFont(font)
-            p.setPen(QPen(self._axis_color, 1))
-            p.drawText(int(px_end + 2), int(py_y0 + 4), "X")
-            # Tick marks every 100mm
-            x_tick = 0
-            while x_tick <= self.world_w:
-                if wx_min <= x_tick <= wx_max:
-                    tx, ty = self._world_to_widget(x_tick, 0)
-                    p.drawLine(int(tx), int(ty - 6), int(tx), int(ty + 6))
-                    if x_tick % 500 == 0 and x_tick > 0:
-                        font2 = QFont("Segoe UI", 7)
-                        p.setFont(font2)
-                        p.drawText(int(tx - 20), int(ty + 16), f"{x_tick}")
-                x_tick += 100
+        c_left = min(x0, x1)
+        c_right = max(x0, x1)
+        c_bottom = max(y0, y1)    # pixel y at world y=0 (bottom)
+        c_top = min(y_top, y0)    # pixel y at world y=2000 (top)
 
-        # Y axis at x=0 (if visible)
-        if wx_min <= 0 <= wx_max:
-            px_x0, py_start = self._world_to_widget(0, max(0, wy_min))
-            _, py_end = self._world_to_widget(0, min(self.world_h, wy_max))
-            p.setPen(QPen(self._axis_color, 1.5))
-            p.drawLine(int(px_x0), int(py_start), int(px_x0), int(py_end))
-            p.drawLine(int(px_x0), int(py_end), int(px_x0 - 4), int(py_end + 10))
-            p.drawLine(int(px_x0), int(py_end), int(px_x0 + 4), int(py_end + 10))
-            font = QFont("Segoe UI", 11, QFont.Bold)
-            p.setFont(font)
-            p.setPen(QPen(self._axis_color, 1))
-            p.drawText(int(px_x0 + 6), int(py_end + 14), "Y")
-            # Tick marks every 100mm
-            y_tick = 0
-            while y_tick <= self.world_h:
-                if wy_min <= y_tick <= wy_max:
-                    tx, ty = self._world_to_widget(0, y_tick)
-                    p.drawLine(int(tx - 6), int(ty), int(tx + 6), int(ty))
-                    if y_tick % 500 == 0 and y_tick > 0:
-                        font2 = QFont("Segoe UI", 7)
-                        p.setFont(font2)
-                        p.drawText(int(tx - 44), int(ty + 4), f"{y_tick}")
-                y_tick += 100
+        axis_color = QColor(80, 80, 80)
+        thick_pen = QPen(axis_color, 2.5)
+        thin_pen = QPen(axis_color, 1)
 
-        # Origin label
-        ox, oy = self._world_to_widget(0, 0)
+        # --- X axis: along bottom edge of canvas (y=0) ---
+        p.setPen(thick_pen)
+        p.drawLine(int(c_left), int(c_bottom), int(c_right + 15), int(c_bottom))
+        # Arrow
+        arrow_x = int(c_right + 15)
+        arrow_y = int(c_bottom)
+        p.drawLine(arrow_x, arrow_y, arrow_x - 10, arrow_y - 5)
+        p.drawLine(arrow_x, arrow_y, arrow_x - 10, arrow_y + 5)
+        p.drawLine(arrow_x - 10, arrow_y - 5, arrow_x - 10, arrow_y + 5)
+
+        # X axis label
+        font = QFont("Segoe UI", 11, QFont.Bold)
+        p.setFont(font)
+        p.setPen(QPen(axis_color, 1))
+        p.drawText(arrow_x + 2, arrow_y + 5, "X")
+
+        # X tick marks and labels (every 100mm, label every 500mm)
+        font_sm = QFont("Segoe UI", 7)
+        p.setFont(font_sm)
+        p.setPen(thin_pen)
+        wx = 0.0
+        while wx <= self.world_w + 1e-6:
+            tx, ty = self._world_to_widget(wx, 0)
+            if c_left <= tx <= c_right:
+                p.drawLine(int(tx), int(c_bottom), int(tx), int(c_bottom + 8))
+                if wx > 0 and int(wx) % 500 == 0:
+                    label = f"{int(wx)}" if wx == int(wx) else f"{wx:.0f}"
+                    p.drawText(int(tx - 14), int(c_bottom + 20), label)
+            wx += 100.0
+
+        # --- Y axis: along left edge of canvas (x=0) ---
+        p.setPen(thick_pen)
+        p.drawLine(int(c_left), int(c_bottom + 5), int(c_left), int(c_top - 15))
+        # Arrow
+        arrow_x = int(c_left)
+        arrow_y = int(c_top - 15)
+        p.drawLine(arrow_x, arrow_y, arrow_x - 5, arrow_y + 10)
+        p.drawLine(arrow_x, arrow_y, arrow_x + 5, arrow_y + 10)
+        p.drawLine(arrow_x - 5, arrow_y + 10, arrow_x + 5, arrow_y + 10)
+
+        # Y axis label
+        font = QFont("Segoe UI", 11, QFont.Bold)
+        p.setFont(font)
+        p.setPen(QPen(axis_color, 1))
+        p.drawText(arrow_x - 16, arrow_y + 20, "Y")
+
+        # Y tick marks and labels (every 100mm, label every 500mm)
+        font_sm = QFont("Segoe UI", 7)
+        p.setFont(font_sm)
+        p.setPen(thin_pen)
+        wy = 0.0
+        while wy <= self.world_h + 1e-6:
+            tx, ty = self._world_to_widget(0, wy)
+            if c_top <= ty <= c_bottom:
+                p.drawLine(int(c_left - 8), int(ty), int(c_left), int(ty))
+                if wy > 0 and int(wy) % 500 == 0:
+                    label = f"{int(wy)}" if wy == int(wy) else f"{wy:.0f}"
+                    p.drawText(int(c_left - 44), int(ty + 4), label)
+            wy += 100.0
+
+        # --- Origin "O" label ---
         font = QFont("Segoe UI", 9, QFont.Bold)
         p.setFont(font)
-        p.setPen(QPen(self._axis_color, 1))
-        p.drawText(int(ox - 14), int(oy + 15), "O")
+        p.setPen(QPen(axis_color, 1))
+        p.drawText(int(c_left - 14), int(c_bottom + 16), "O")
+
+        # --- Canvas dimension labels ---
+        font_dim = QFont("Segoe UI", 8)
+        p.setFont(font_dim)
+        p.setPen(QPen(QColor(140, 140, 140)))
+        mx_px = (c_left + c_right) / 2
+        my_px = (c_top + c_bottom) / 2
+        # Bottom: 3000mm
+        p.drawText(int(mx_px - 22), int(c_bottom + 36), "3000 mm")
+        # Left: 2000mm (vertical text)
+        p.save()
+        p.translate(int(c_left - 24), int(my_px + 30))
+        p.rotate(-90)
+        p.drawText(0, 0, "2000 mm")
+        p.restore()
 
     def _draw_airfoil(self, p: QPainter):
         if self.airfoil_x is None or self.airfoil_y is None:
