@@ -207,11 +207,17 @@ class InteractiveGeometryCanvas(QWidget):
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape:
-            # Cancel current operation
             if self._line_start is not None:
+                # Remove the start point that was added
+                if self.points and self.points[-1] == self._line_start:
+                    self.points.pop()
                 self._line_start = None
                 self.status_changed.emit("直线绘制已取消")
             elif self._pending_points:
+                # Remove pending control points from points list
+                for _ in self._pending_points:
+                    if self.points:
+                        self.points.pop()
                 self._pending_points = []
                 self.status_changed.emit("样条线绘制已取消")
             elif self.selected:
@@ -402,8 +408,10 @@ class InteractiveGeometryCanvas(QWidget):
         elif tool == GeoTool.LINE:
             if self._line_start is None:
                 self._line_start = (wx, wy)
+                self.points.append((wx, wy))
                 self.status_changed.emit(f"直线起点: ({wx:.1f}, {wy:.1f}) — 点击终点")
             else:
+                self.points.append((wx, wy))
                 self.lines.append((self._line_start, (wx, wy)))
                 self.status_changed.emit(
                     f"直线: ({self._line_start[0]:.1f},{self._line_start[1]:.1f}) → ({wx:.1f},{wy:.1f})"
@@ -411,6 +419,7 @@ class InteractiveGeometryCanvas(QWidget):
                 self._line_start = None
         elif tool == GeoTool.SPLINE:
             self._pending_points.append((wx, wy))
+            self.points.append((wx, wy))
             n = len(self._pending_points)
             self.status_changed.emit(f"样条线控制点 {n}: ({wx:.1f}, {wy:.1f}) — 继续点击，双击完成")
         elif tool == GeoTool.DELETE:
