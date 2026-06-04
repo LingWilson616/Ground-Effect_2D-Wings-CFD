@@ -23,10 +23,9 @@ class GeoTool(Enum):
     POINT = auto()
     LINE = auto()
     SPLINE = auto()
-    CREATE = auto()
     DELETE = auto()
     MOVE = auto()
-    SELECT = auto()  # default — pan mode
+    SELECT = auto()  # select & highlight elements
 
 
 class InteractiveGeometryCanvas(QWidget):
@@ -58,7 +57,14 @@ class InteractiveGeometryCanvas(QWidget):
         self._drag_threshold = 5
         self._mouse_press_pos = None
         self._released_without_drag = False
-        self._spline_finished = False  # ignore stray release after double-click
+        self._spline_finished = False
+
+        # Selection & move state
+        self.selected = None  # ('point', index) or ('line', index) or ('spline', index)
+        self._moving = False
+        self._move_start_wx = 0.0
+        self._move_start_wy = 0.0
+        self._move_original_data = None
 
         # Line drawing state
         self._line_start = None  # waiting for second point
@@ -102,13 +108,12 @@ class InteractiveGeometryCanvas(QWidget):
         self._line_start = None
         self._pending_points = []
         names = {
-            GeoTool.SELECT: "选择/平移 — 点击操作 | 长按拖动平移 | 滚轮缩放",
+            GeoTool.SELECT: "选择 — 点击选中元素 | 长按拖动平移",
             GeoTool.POINT: "点工具 — 点击画布创建点 | 长按拖动平移",
             GeoTool.LINE: "直线工具 — 点击两点创建直线 | 长按拖动平移",
             GeoTool.SPLINE: "样条线 — 点击多点，双击完成 | 长按拖动平移",
-            GeoTool.CREATE: "创建 — 点击创建几何元素 | 长按拖动平移",
             GeoTool.DELETE: "删除 — 点击删除最近元素 | 长按拖动平移",
-            GeoTool.MOVE: "移动 — 拖动几何元素",
+            GeoTool.MOVE: "移动 — 点击选中元素，拖动移动",
         }
         self.status_changed.emit(names.get(tool, ""))
         self.update()
@@ -149,31 +154,48 @@ class InteractiveGeometryCanvas(QWidget):
 
     def mousePressEvent(self, event: QMouseEvent):
         self._mouse_press_pos = event.position()
-        self._released_without_drag = False
 
         if event.button() == Qt.LeftButton:
-            # Start potential pan — will become click if released without moving
             self._pan_start_x = event.position().x()
             self._pan_start_y = event.position().y()
             self._pan_start_offset_x = self._offset_x
             self._pan_start_offset_y = self._offset_y
+            self._panning = False
+            self._moving = False
 
         elif event.button() == Qt.MiddleButton:
             self._fit_to_widget()
+            self.selected = None
             self.status_changed.emit("视图已重置")
 
     def mouseMoveEvent(self, event: QMouseEvent):
         if event.buttons() & Qt.LeftButton:
             dx = event.position().x() - self._pan_start_x
             dy = event.position().y() - self._pan_start_y
+
             if abs(dx) > self._drag_threshold or abs(dy) > self._drag_threshold:
-                if not self._panning:
-                    self._panning = True
-                    self.setCursor(Qt.ClosedHandCursor)
-                self._offset_x = self._pan_start_offset_x + dx
-                self._offset_y = self._pan_start_offset_y - dy
-                self._clamp_view()
-                self.update()
+                # MOVE tool with a selected element: move the element
+                if self._current_tool == GeoTool.MOVE and self.selected is not None:
+                    if not self._moving:
+                        self._moving = True
+                        self._save_move_originals()
+                        wx, wy = self._widget_to_world(self._pan_start_x, self._pan_start_y)
+                        self._move_start_wx = wx
+                        self._move_start_wy = wy
+                    wx, wy = self._widget_to_world(event.position().x(), event.position().y())
+                    delta_wx = wx - self._move_start_wx
+                    delta_wy = wy - self._move_start_wy
+                    self._apply_move_delta(delta_wx, delta_wy)
+                else:
+                    # Pan canvas
+                    if not self._panning:
+                        self._panning = True
+                        self.setCursor(Qt.ClosedHandCursor)
+                    self._offset_x = self._pan_start_offset_x + dx
+                    self._offset_y = self._pan_start_offset_y - dy
+                    self._clamp_view()
+            self.update()
+
         wx, wy = self._widget_to_world(event.position().x(), event.position().y())
         self.mouse_moved.emit(wx, wy)
         if self._line_start is not None:
@@ -181,12 +203,75 @@ class InteractiveGeometryCanvas(QWidget):
 
     def mouseReleaseEvent(self, event: QMouseEvent):
         if event.button() == Qt.LeftButton:
-            if self._spline_finished:
+            if self._moving:
+                self._moving = False
+                self.status_changed.emit("移动完成")
+            elif self._spline_finished:
                 self._spline_finished = False
             elif not self._panning:
                 self._execute_tool_action(event.position().x(), event.position().y())
             self._panning = False
             self.setCursor(Qt.ArrowCursor)
+
+    # ===== Hit test & selection =====
+
+    def _find_element_at(self, wx: float, wy: float, tolerance_mm: float = 30.0):
+        """Find nearest geometry element to world point. Returns (type, index) or None."""
+        threshold2 = tolerance_mm ** 2 * (1 / self._scale)  # convert to world-space tolerance squared
+
+        best = None
+        best_dist = float('inf')
+
+        # Check points
+        for i, (px, py) in enumerate(self.points):
+            d2 = (wx - px) ** 2 + (wy - py) ** 2
+            if d2 < threshold2 and d2 < best_dist:
+                best_dist = d2
+                best = ('point', i)
+
+        # Check lines (midpoint distance)
+        for i, ((x1, y1), (x2, y2)) in enumerate(self.lines):
+            mx = (x1 + x2) / 2
+            my = (y1 + y2) / 2
+            d2 = (wx - mx) ** 2 + (wy - my) ** 2
+            if d2 < threshold2 and d2 < best_dist:
+                best_dist = d2
+                best = ('line', i)
+
+        # Check splines (nearest point on curve)
+        for i, curve in enumerate(self.splines):
+            for cx, cy in curve:
+                d2 = (wx - cx) ** 2 + (wy - cy) ** 2
+                if d2 < threshold2 and d2 < best_dist:
+                    best_dist = d2
+                    best = ('spline', i)
+
+        return best
+
+    def _save_move_originals(self):
+        """Snapshot original data for move undo."""
+        sel_type, idx = self.selected
+        if sel_type == 'point':
+            self._move_original_data = list(self.points[idx])
+        elif sel_type == 'line':
+            p1, p2 = self.lines[idx]
+            self._move_original_data = [(p1[0], p1[1]), (p2[0], p2[1])]
+        elif sel_type == 'spline':
+            self._move_original_data = [list(p) for p in self.splines[idx]]
+
+    def _apply_move_delta(self, dx: float, dy: float):
+        """Apply translation delta to selected element."""
+        if self.selected is None:
+            return
+        sel_type, idx = self.selected
+        orig = self._move_original_data
+        if sel_type == 'point':
+            self.points[idx] = (orig[0] + dx, orig[1] + dy)
+        elif sel_type == 'line':
+            (x1, y1), (x2, y2) = orig
+            self.lines[idx] = ((x1 + dx, y1 + dy), (x2 + dx, y2 + dy))
+        elif sel_type == 'spline':
+            self.splines[idx] = [(px + dx, py + dy) for px, py in orig]
 
     def mouseDoubleClickEvent(self, event: QMouseEvent):
         if event.button() == Qt.LeftButton and self._current_tool == GeoTool.SPLINE:
@@ -252,7 +337,38 @@ class InteractiveGeometryCanvas(QWidget):
             return
 
         tool = self._current_tool
-        if tool == GeoTool.SELECT or tool == GeoTool.POINT or tool == GeoTool.CREATE:
+        if tool == GeoTool.SELECT:
+            elem = self._find_element_at(wx, wy)
+            if elem is not None:
+                self.selected = elem
+                sel_type, idx = elem
+                if sel_type == 'point':
+                    px, py = self.points[idx]
+                    self.status_changed.emit(f"选中: 点 #{idx+1} ({px:.1f}, {py:.1f}) mm")
+                elif sel_type == 'line':
+                    (x1, y1), (x2, y2) = self.lines[idx]
+                    self.status_changed.emit(f"选中: 直线 #{idx+1} ({x1:.0f},{y1:.0f})→({x2:.0f},{y2:.0f})")
+                elif sel_type == 'spline':
+                    curve = self.splines[idx]
+                    self.status_changed.emit(f"选中: 样条线 #{idx+1} ({len(curve)} 点)")
+            else:
+                self.selected = None
+                self.status_changed.emit("取消选中")
+            self.update()
+        elif tool == GeoTool.MOVE:
+            elem = self._find_element_at(wx, wy)
+            if elem is not None:
+                self.selected = elem
+                sel_type, idx = elem
+                if sel_type == 'point':
+                    px, py = self.points[idx]
+                    self.status_changed.emit(f"移动: 点 #{idx+1} — 拖动鼠标移动")
+                elif sel_type == 'line':
+                    self.status_changed.emit(f"移动: 直线 #{idx+1} — 拖动鼠标移动")
+                elif sel_type == 'spline':
+                    self.status_changed.emit(f"移动: 样条线 #{idx+1} — 拖动鼠标移动")
+            self.update()
+        elif tool == GeoTool.POINT:
             self.points.append((wx, wy))
             self.point_created.emit(wx, wy)
             self.status_changed.emit(f"创建点: ({wx:.1f}, {wy:.1f}) mm")
@@ -364,16 +480,15 @@ class InteractiveGeometryCanvas(QWidget):
         font = QFont("Segoe UI", 10)
         p.setFont(font)
         tool_names = {
-            GeoTool.SELECT: "选择/平移",
+            GeoTool.SELECT: "选择",
             GeoTool.POINT: "点",
             GeoTool.LINE: "直线",
             GeoTool.SPLINE: "样条线",
-            GeoTool.CREATE: "创建",
             GeoTool.DELETE: "删除",
             GeoTool.MOVE: "移动",
         }
         name = tool_names.get(self._current_tool, "")
-        p.drawText(self.width() - 200, self.height() - 12, f"工具: {name} | 点击操作 | 长按平移")
+        p.drawText(self.width() - 220, self.height() - 12, f"工具: {name} | 点击操作 | 长按平移")
 
     def _draw_background(self, p: QPainter):
         """Fill widget background and draw canvas border rectangle."""
@@ -579,27 +694,45 @@ class InteractiveGeometryCanvas(QWidget):
 
     def _draw_geometry_elements(self, p: QPainter):
         """Draw created points, lines, splines, and previews."""
-        # Points
-        p.setBrush(QBrush(self._point_color))
-        p.setPen(Qt.NoPen)
+        highlight = QColor(243, 156, 18)       # orange
+        highlight_pen = QPen(highlight, 3)
+        highlight_brush = QBrush(highlight)
         radius = max(3.0, self._point_radius)
-        for wx, wy in self.points:
+
+        # Points
+        for i, (wx, wy) in enumerate(self.points):
             px, py = self._world_to_widget(wx, wy)
+            is_sel = self.selected is not None and self.selected == ('point', i)
+            if is_sel:
+                p.setBrush(highlight_brush)
+                p.setPen(highlight_pen)
+                p.drawEllipse(QPointF(px, py), radius + 3, radius + 3)
+                # Label
+                font = QFont("Segoe UI", 7)
+                p.setFont(font)
+                p.setPen(QPen(highlight, 1))
+                p.drawText(int(px + 8), int(py - 8), f"点{i+1}")
+            p.setBrush(QBrush(self._point_color if not is_sel else highlight))
+            p.setPen(Qt.NoPen if not is_sel else highlight_pen)
             p.drawEllipse(QPointF(px, py), radius, radius)
 
         # Lines
-        p.setPen(QPen(QColor(30, 30, 30), 1.5))
-        for (x1, y1), (x2, y2) in self.lines:
+        for i, ((x1, y1), (x2, y2)) in enumerate(self.lines):
+            is_sel = self.selected is not None and self.selected == ('line', i)
+            pen = highlight_pen if is_sel else QPen(QColor(30, 30, 30), 2.5 if is_sel else 1.5)
+            p.setPen(pen)
             px1, py1 = self._world_to_widget(x1, y1)
             px2, py2 = self._world_to_widget(x2, y2)
             p.drawLine(int(px1), int(py1), int(px2), int(py2))
 
         # Completed splines
-        p.setPen(QPen(QColor(31, 111, 235), 2))
-        for curve in self.splines:
-            for i in range(len(curve) - 1):
-                px1, py1 = self._world_to_widget(*curve[i])
-                px2, py2 = self._world_to_widget(*curve[i + 1])
+        for i, curve in enumerate(self.splines):
+            is_sel = self.selected is not None and self.selected == ('spline', i)
+            pen = highlight_pen if is_sel else QPen(QColor(31, 111, 235), 2.5 if is_sel else 2)
+            p.setPen(pen)
+            for j in range(len(curve) - 1):
+                px1, py1 = self._world_to_widget(*curve[j])
+                px2, py2 = self._world_to_widget(*curve[j + 1])
                 p.drawLine(int(px1), int(py1), int(px2), int(py2))
 
         # Pending spline control points + preview polyline
@@ -648,6 +781,8 @@ class InteractiveGeometryCanvas(QWidget):
         self.lines.clear()
         self.splines.clear()
         self._pending_points = []
+        self.selected = None
+        self._moving = False
         self.clear_airfoil()
         self.update()
 
