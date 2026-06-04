@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+dist/
+build/
+*.spec
+*.exe
+.DS_Store
+Thumbs.db
