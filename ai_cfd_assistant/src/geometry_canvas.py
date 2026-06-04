@@ -55,9 +55,10 @@ class InteractiveGeometryCanvas(QWidget):
         self._pan_start_y = 0
         self._pan_start_offset_x = 0.0
         self._pan_start_offset_y = 0.0
-        self._drag_threshold = 5  # pixels — beyond this, it's a pan, not a click
+        self._drag_threshold = 5
         self._mouse_press_pos = None
         self._released_without_drag = False
+        self._spline_finished = False  # ignore stray release after double-click
 
         # Line drawing state
         self._line_start = None  # waiting for second point
@@ -69,6 +70,7 @@ class InteractiveGeometryCanvas(QWidget):
         # Geometry elements
         self.points: list[tuple[float, float]] = []
         self.lines: list[tuple[tuple[float, float], tuple[float, float]]] = []
+        self.splines: list[list[tuple[float, float]]] = []  # interpolated spline points
         self.airfoil_x = None
         self.airfoil_y = None
         self.airfoil_name = ""
@@ -179,21 +181,67 @@ class InteractiveGeometryCanvas(QWidget):
 
     def mouseReleaseEvent(self, event: QMouseEvent):
         if event.button() == Qt.LeftButton:
-            if not self._panning:
-                # Was a click (no drag) — execute tool action
-                self._released_without_drag = True
+            if self._spline_finished:
+                self._spline_finished = False
+            elif not self._panning:
                 self._execute_tool_action(event.position().x(), event.position().y())
             self._panning = False
             self.setCursor(Qt.ArrowCursor)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent):
         if event.button() == Qt.LeftButton and self._current_tool == GeoTool.SPLINE:
+            # First click of the double-click already added a point via mouseReleaseEvent.
+            # Remove that extra point, then finish the spline with the remaining points.
+            if self._pending_points:
+                self._pending_points.pop()
             if len(self._pending_points) >= 2:
-                self.status_changed.emit(f"样条线完成: {len(self._pending_points)} 个控制点")
+                curve = self._catmull_rom_spline(self._pending_points)
+                self.splines.append(curve)
+                self.status_changed.emit(
+                    f"样条线完成: {len(self._pending_points)} 个控制点 → {len(curve)} 个插值点"
+                )
                 self._pending_points = []
+                self._spline_finished = True  # block the trailing release event
             else:
-                self.status_changed.emit("样条线至少需要2个点")
+                self.status_changed.emit("样条线至少需要2个点，请继续点击添加控制点")
             self.update()
+
+    @staticmethod
+    def _catmull_rom_spline(pts: list[tuple[float, float]], n_per_seg: int = 20) -> list[tuple[float, float]]:
+        """Generate Catmull-Rom spline from control points.
+
+        Uses centripetal parameterization for smooth, loop-free curves.
+        """
+        n = len(pts)
+        if n < 2:
+            return pts[:]
+
+        # Duplicate endpoints for natural boundary condition
+        p = [pts[0]] + pts + [pts[-1]]
+
+        result = [pts[0]]
+        for i in range(1, n):
+            p0, p1, p2, p3 = p[i - 1], p[i], p[i + 1], p[i + 2]
+            for t_idx in range(1, n_per_seg + 1):
+                t = t_idx / n_per_seg
+                # Catmull-Rom basis with tension 0.5
+                tt = t * t
+                ttt = tt * t
+                x = 0.5 * (
+                    (2 * p1[0]) +
+                    (-p0[0] + p2[0]) * t +
+                    (2 * p0[0] - 5 * p1[0] + 4 * p2[0] - p3[0]) * tt +
+                    (-p0[0] + 3 * p1[0] - 3 * p2[0] + p3[0]) * ttt
+                )
+                y = 0.5 * (
+                    (2 * p1[1]) +
+                    (-p0[1] + p2[1]) * t +
+                    (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * tt +
+                    (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * ttt
+                )
+                result.append((x, y))
+
+        return result
 
     def _execute_tool_action(self, px: float, py: float):
         """Perform the current tool's action at the given widget pixel position."""
@@ -229,6 +277,13 @@ class InteractiveGeometryCanvas(QWidget):
             elif self.lines:
                 removed = self.lines.pop()
                 self.status_changed.emit("已删除最近一条直线")
+            elif self.splines:
+                removed = self.splines.pop()
+                self.status_changed.emit(f"已删除样条线 ({len(removed)} 个插值点)")
+            elif self._pending_points:
+                self._pending_points.pop()
+                n = len(self._pending_points)
+                self.status_changed.emit(f"已删除控制点，剩余 {n}" + (" 个 — 双击完成" if n > 0 else " 个，已取消"))
             else:
                 self.status_changed.emit("没有可删除的元素")
         self.update()
@@ -523,7 +578,7 @@ class InteractiveGeometryCanvas(QWidget):
             p.drawText(int(lx), int(ly), self.airfoil_name)
 
     def _draw_geometry_elements(self, p: QPainter):
-        """Draw created points, lines, and previews."""
+        """Draw created points, lines, splines, and previews."""
         # Points
         p.setBrush(QBrush(self._point_color))
         p.setPen(Qt.NoPen)
@@ -532,20 +587,36 @@ class InteractiveGeometryCanvas(QWidget):
             px, py = self._world_to_widget(wx, wy)
             p.drawEllipse(QPointF(px, py), radius, radius)
 
-        # Pending spline points
-        if self._pending_points:
-            p.setBrush(QBrush(QColor(31, 111, 235)))
-            p.setPen(Qt.NoPen)
-            for wx, wy in self._pending_points:
-                px, py = self._world_to_widget(wx, wy)
-                p.drawEllipse(QPointF(px, py), radius, radius)
-
         # Lines
         p.setPen(QPen(QColor(30, 30, 30), 1.5))
         for (x1, y1), (x2, y2) in self.lines:
             px1, py1 = self._world_to_widget(x1, y1)
             px2, py2 = self._world_to_widget(x2, y2)
             p.drawLine(int(px1), int(py1), int(px2), int(py2))
+
+        # Completed splines
+        p.setPen(QPen(QColor(31, 111, 235), 2))
+        for curve in self.splines:
+            for i in range(len(curve) - 1):
+                px1, py1 = self._world_to_widget(*curve[i])
+                px2, py2 = self._world_to_widget(*curve[i + 1])
+                p.drawLine(int(px1), int(py1), int(px2), int(py2))
+
+        # Pending spline control points + preview polyline
+        if self._pending_points:
+            # Preview polyline connecting control points
+            p.setPen(QPen(QColor(31, 111, 235, 120), 1.2, Qt.DashLine))
+            for i in range(len(self._pending_points) - 1):
+                px1, py1 = self._world_to_widget(*self._pending_points[i])
+                px2, py2 = self._world_to_widget(*self._pending_points[i + 1])
+                p.drawLine(int(px1), int(py1), int(px2), int(py2))
+
+            # Control point markers
+            p.setBrush(QBrush(QColor(31, 111, 235)))
+            p.setPen(Qt.NoPen)
+            for wx, wy in self._pending_points:
+                px, py = self._world_to_widget(wx, wy)
+                p.drawEllipse(QPointF(px, py), radius + 1, radius + 1)
 
         # Line preview (from start to current mouse)
         if self._line_start is not None:
@@ -575,6 +646,8 @@ class InteractiveGeometryCanvas(QWidget):
     def clear_all(self):
         self.points.clear()
         self.lines.clear()
+        self.splines.clear()
+        self._pending_points = []
         self.clear_airfoil()
         self.update()
 
