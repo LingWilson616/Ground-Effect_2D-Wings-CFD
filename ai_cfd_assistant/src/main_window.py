@@ -181,17 +181,23 @@ class MainWindow(QMainWindow):
         self.workspace = QStackedWidget()
         self.workspace.setStyleSheet("background-color: #0d1117;")
 
-        # Geometry workspace (placeholder canvas)
+        # Geometry workspace — real canvas with grid
+        from .viz_widgets import MplCanvas
         self.geometry_workspace = QWidget()
         geo_layout = QVBoxLayout(self.geometry_workspace)
         geo_layout.setContentsMargins(0, 0, 0, 0)
-        geo_canvas = QLabel("流场几何幕布\n3000mm × 2000mm\n\n几何工具已激活，使用上方工具栏创建几何元素")
-        geo_canvas.setAlignment(Qt.AlignCenter)
-        geo_canvas.setStyleSheet(
-            "background-color: #e8e8e8; color: #666666; font-size: 16px; "
-            "border: 1px solid #cccccc; margin: 8px; border-radius: 4px;"
+        geo_layout.setSpacing(0)
+
+        self.geo_toolbar_label = QLabel("几何工具栏已激活 — 使用上方工具栏创建和编辑几何元素")
+        self.geo_toolbar_label.setStyleSheet(
+            "color: #8b949e; font-size: 11px; padding: 6px 12px; background: #161b22; border-bottom: 1px solid #30363d;"
         )
-        geo_layout.addWidget(geo_canvas)
+        geo_layout.addWidget(self.geo_toolbar_label)
+
+        self.geo_canvas = MplCanvas(figsize=(8, 6))
+        self.geo_canvas.setStyleSheet("background-color: #e8e8e8; border: none;")
+        geo_layout.addWidget(self.geo_canvas, stretch=1)
+        self._draw_geometry_grid()
         self.workspace.addWidget(self.geometry_workspace)
 
         # Region workspace
@@ -315,11 +321,55 @@ class MainWindow(QMainWindow):
 
     # --- Menu actions ---
 
+    def _draw_geometry_grid(self, x=None, y=None, name=""):
+        """Draw the geometry canvas with 10mm grid and optional airfoil."""
+        self.geo_canvas.fig.clear()
+        ax = self.geo_canvas.fig.add_subplot(111)
+        ax.set_facecolor('#ececec')
+
+        # Grid (10mm units on 3000x2000 canvas → normalized to 0–3000, 0–2000)
+        ax.set_xlim(-50, 3050)
+        ax.set_ylim(-50, 2050)
+        ax.set_xticks(range(0, 3001, 100))
+        ax.set_yticks(range(0, 2001, 100))
+        ax.set_xticklabels([])
+        ax.set_yticklabels([])
+        ax.grid(True, color='#d0d0d0', linewidth=0.3)
+        # Major grid every 100mm
+        for spine in ax.spines.values():
+            spine.set_color('#aaaaaa')
+
+        # Coordinate axes
+        ax.arrow(50, 50, 200, 0, head_width=20, head_length=30, fc='#333333', ec='#333333', linewidth=1.5)
+        ax.arrow(50, 50, 0, 200, head_width=20, head_length=30, fc='#333333', ec='#333333', linewidth=1.5)
+        ax.text(270, 30, 'X', fontsize=12, fontweight='bold', color='#333333', ha='center')
+        ax.text(20, 270, 'Y', fontsize=12, fontweight='bold', color='#333333', va='center')
+        ax.text(30, 30, 'O', fontsize=10, color='#333333', ha='right', va='top')
+
+        # Scale label
+        ax.text(1500, -30, '3000 mm', fontsize=9, color='#888888', ha='center')
+        ax.text(-35, 1000, '2000 mm', fontsize=9, color='#888888', va='center', rotation=90)
+
+        # Draw airfoil if provided
+        if x is not None and y is not None:
+            # Scale airfoil to fit in center of canvas (chord ~1000mm)
+            scale = 1000.0
+            cx, cy = 1500, 1000
+            x_scaled = (x - 0.5) * scale + cx
+            y_scaled = y * scale + cy
+            ax.fill(x_scaled, y_scaled, color='#1f6feb', alpha=0.25, edgecolor='#1f6feb', linewidth=2)
+            title = f'{name}' if name else '导入翼型'
+            ax.set_title(title, fontsize=11, color='#333333', fontweight='bold', pad=10)
+
+        self.geo_canvas.fig.tight_layout(pad=0.5)
+        self.geo_canvas.draw()
+
     def _on_new(self):
         self.chat_widget.clear_chat()
         self.current_airfoil_data = None
         self.current_airfoil_name = "NACA 2412"
         self.current_result = None
+        self._draw_geometry_grid()
         self.viz_panel.set_airfoil("2412")
         self._set_status("新项目已创建")
 
@@ -355,7 +405,9 @@ class MainWindow(QMainWindow):
         # Mirror y if mostly negative
         if np.mean(y_norm) < 0:
             y_norm = -y_norm
-        # Update airfoil panel
+        # Update geometry canvas
+        self._draw_geometry_grid(x_norm, y_norm, self.current_airfoil_name)
+        # Update viz panels
         self.viz_panel.airfoil_panel.set_custom_airfoil(x_norm, y_norm, self.current_airfoil_name)
         self.viz_panel.pressure_panel.set_custom_airfoil(x_norm, y_norm, self.current_airfoil_name)
         self.viz_panel.streamline_panel.set_custom_airfoil(x_norm, y_norm, self.current_airfoil_name)
