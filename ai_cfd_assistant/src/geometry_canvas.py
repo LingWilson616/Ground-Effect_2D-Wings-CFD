@@ -68,7 +68,7 @@ class InteractiveGeometryCanvas(QWidget):
         self._ctrl_held = False  # Ctrl for multi-select
 
         # Line drawing state
-        self._line_start = None  # waiting for second point
+        self._line_start = -1  # index of start point, -1 means waiting
         self._pending_points = []  # for spline
 
         # Tool system
@@ -76,8 +76,8 @@ class InteractiveGeometryCanvas(QWidget):
 
         # Geometry elements
         self.points: list[tuple[float, float]] = []
-        self.lines: list[tuple[tuple[float, float], tuple[float, float]]] = []
-        self.splines: list[list[tuple[float, float]]] = []  # interpolated spline points
+        self.lines: list[tuple[int, int]] = []          # (point_index_a, point_index_b)
+        self.splines: list[list[tuple[float, float]]] = []  # interpolated curve points
         self.airfoil_x = None
         self.airfoil_y = None
         self.airfoil_name = ""
@@ -108,7 +108,7 @@ class InteractiveGeometryCanvas(QWidget):
 
     def set_tool(self, tool: GeoTool):
         self._current_tool = tool
-        self._line_start = None
+        self._line_start = -1
         self._pending_points = []
         names = {
             GeoTool.SELECT: "选择 — 点击选中元素 | 长按拖动平移",
@@ -202,16 +202,16 @@ class InteractiveGeometryCanvas(QWidget):
 
         wx, wy = self._widget_to_world(event.position().x(), event.position().y())
         self.mouse_moved.emit(wx, wy)
-        if self._line_start is not None:
+        if self._line_start >= 0:
             self.update()
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape:
-            if self._line_start is not None:
-                # Remove the start point that was added
-                if self.points and self.points[-1] == self._line_start:
-                    self.points.pop()
-                self._line_start = None
+            if self._line_start >= 0:
+                # Remove the start point
+                if self._line_start < len(self.points):
+                    self.points.pop(self._line_start)
+                self._line_start = -1
                 self.status_changed.emit("直线绘制已取消")
             elif self._pending_points:
                 # Remove pending control points from points list
@@ -258,7 +258,11 @@ class InteractiveGeometryCanvas(QWidget):
                 best = ('point', i)
 
         # Check lines (midpoint distance)
-        for i, ((x1, y1), (x2, y2)) in enumerate(self.lines):
+        for i, (ia, ib) in enumerate(self.lines):
+            if ia >= len(self.points) or ib >= len(self.points):
+                continue
+            x1, y1 = self.points[ia]
+            x2, y2 = self.points[ib]
             mx = (x1 + x2) / 2
             my = (y1 + y2) / 2
             d2 = (wx - mx) ** 2 + (wy - my) ** 2
@@ -283,21 +287,27 @@ class InteractiveGeometryCanvas(QWidget):
             if sel_type == 'point':
                 self._move_original_data.append(('point', idx, self.points[idx]))
             elif sel_type == 'line':
-                p1, p2 = self.lines[idx]
-                self._move_original_data.append(('line', idx, (p1, p2)))
+                # Moving a line means moving both endpoints
+                ia, ib = self.lines[idx]
+                if ia < len(self.points) and ib < len(self.points):
+                    self._move_original_data.append(('line', idx, ia, ib, self.points[ia], self.points[ib]))
             elif sel_type == 'spline':
                 self._move_original_data.append(('spline', idx, [(p[0], p[1]) for p in self.splines[idx]]))
 
     def _apply_move_delta(self, dx: float, dy: float):
         """Apply translation delta to all selected elements."""
         for entry in self._move_original_data:
-            sel_type, idx, orig = entry
+            sel_type = entry[0]
+            idx = entry[1]
             if sel_type == 'point':
+                _, _, orig = entry
                 self.points[idx] = (orig[0] + dx, orig[1] + dy)
             elif sel_type == 'line':
-                (x1, y1), (x2, y2) = orig
-                self.lines[idx] = ((x1 + dx, y1 + dy), (x2 + dx, y2 + dy))
+                _, _, ia, ib, orig_a, orig_b = entry
+                self.points[ia] = (orig_a[0] + dx, orig_a[1] + dy)
+                self.points[ib] = (orig_b[0] + dx, orig_b[1] + dy)
             elif sel_type == 'spline':
+                _, _, orig = entry
                 self.splines[idx] = [(px + dx, py + dy) for px, py in orig]
 
     def mouseDoubleClickEvent(self, event: QMouseEvent):
@@ -406,17 +416,17 @@ class InteractiveGeometryCanvas(QWidget):
             self.point_created.emit(wx, wy)
             self.status_changed.emit(f"创建点: ({wx:.1f}, {wy:.1f}) mm")
         elif tool == GeoTool.LINE:
-            if self._line_start is None:
-                self._line_start = (wx, wy)
-                self.points.append((wx, wy))
+            idx_new = len(self.points)
+            self.points.append((wx, wy))
+            if self._line_start < 0:
+                self._line_start = idx_new
                 self.status_changed.emit(f"直线起点: ({wx:.1f}, {wy:.1f}) — 点击终点")
             else:
-                self.points.append((wx, wy))
-                self.lines.append((self._line_start, (wx, wy)))
+                self.lines.append((self._line_start, idx_new))
                 self.status_changed.emit(
-                    f"直线: ({self._line_start[0]:.1f},{self._line_start[1]:.1f}) → ({wx:.1f},{wy:.1f})"
+                    f"直线: 点#{self._line_start+1} → 点#{idx_new+1}"
                 )
-                self._line_start = None
+                self._line_start = -1
         elif tool == GeoTool.SPLINE:
             self._pending_points.append((wx, wy))
             self.points.append((wx, wy))
@@ -424,11 +434,19 @@ class InteractiveGeometryCanvas(QWidget):
             self.status_changed.emit(f"样条线控制点 {n}: ({wx:.1f}, {wy:.1f}) — 继续点击，双击完成")
         elif tool == GeoTool.DELETE:
             if self.points:
+                removed_idx = len(self.points) - 1
                 removed = self.points.pop()
+                # Remove lines that reference the deleted point
+                self.lines = [(a, b) for a, b in self.lines
+                              if a != removed_idx and b != removed_idx]
+                # Re-index lines (decrement indices > removed_idx)
+                self.lines = [(a - 1 if a > removed_idx else a,
+                               b - 1 if b > removed_idx else b)
+                              for a, b in self.lines]
                 self.status_changed.emit(f"已删除点: ({removed[0]:.1f}, {removed[1]:.1f})")
             elif self.lines:
                 removed = self.lines.pop()
-                self.status_changed.emit("已删除最近一条直线")
+                self.status_changed.emit(f"已删除直线: 点#{removed[0]+1}→点#{removed[1]+1}")
             elif self.splines:
                 removed = self.splines.pop()
                 self.status_changed.emit(f"已删除样条线 ({len(removed)} 个插值点)")
@@ -755,8 +773,12 @@ class InteractiveGeometryCanvas(QWidget):
             p.setBrush(QBrush(highlight if is_sel else self._point_color))
             p.drawEllipse(QPointF(px, py), radius, radius)
 
-        # Lines
-        for i, ((x1, y1), (x2, y2)) in enumerate(self.lines):
+        # Lines — indices into self.points
+        for i, (ia, ib) in enumerate(self.lines):
+            if ia >= len(self.points) or ib >= len(self.points):
+                continue
+            x1, y1 = self.points[ia]
+            x2, y2 = self.points[ib]
             is_sel = ('line', i) in sel_set
             pen = highlight_pen if is_sel else QPen(QColor(30, 30, 30), 2.5 if is_sel else 1.5)
             p.setPen(pen)
@@ -792,10 +814,11 @@ class InteractiveGeometryCanvas(QWidget):
                 px, py = self._world_to_widget(wx, wy)
                 p.drawEllipse(QPointF(px, py), radius + 1, radius + 1)
 
-        # Line preview (from start to current mouse)
-        if self._line_start is not None:
+        # Line preview (from start point index to current mouse)
+        if self._line_start >= 0 and self._line_start < len(self.points):
             p.setPen(QPen(self._line_preview, 1.5, Qt.DashLine))
-            px1, py1 = self._world_to_widget(*self._line_start)
+            x1, y1 = self.points[self._line_start]
+            px1, py1 = self._world_to_widget(x1, y1)
             cursor_pos = self.mapFromGlobal(self.cursor().pos())
             p.drawLine(int(px1), int(py1), cursor_pos.x(), cursor_pos.y())
 
@@ -832,7 +855,11 @@ class InteractiveGeometryCanvas(QWidget):
         self.update()
 
     def add_line(self, x1: float, y1: float, x2: float, y2: float):
-        self.lines.append(((x1, y1), (x2, y2)))
+        i1 = len(self.points)
+        self.points.append((x1, y1))
+        i2 = len(self.points)
+        self.points.append((x2, y2))
+        self.lines.append((i1, i2))
         self.update()
 
     def screen_to_world(self, px: float, py: float) -> tuple[float, float]:
@@ -841,54 +868,61 @@ class InteractiveGeometryCanvas(QWidget):
     # ===== Constraint & profile operations =====
 
     def coincident_constraint(self) -> bool:
-        """Snap two selected points together. Snaps 2nd to 1st."""
+        """Snap two selected points together. Snaps higher-index to lower-index point."""
         point_sels = [(t, i) for t, i in self.selected if t == 'point']
         if len(point_sels) != 2:
             self.status_changed.emit("重合约束需要恰好选中2个点 (Ctrl+点击多选)")
             return False
         _, i0 = point_sels[0]
         _, i1 = point_sels[1]
-        target = self.points[i0]
-        self.points[i1] = target
-        self.status_changed.emit(f"重合约束: 点#{i1+1} → 点#{i0+1} ({target[0]:.1f}, {target[1]:.1f})")
+        survivor_idx = min(i0, i1)
+        removed_idx = max(i0, i1)
+        target = self.points[survivor_idx]
+        # Remove the higher-index point
+        self.points.pop(removed_idx)
+        # Replace line references to removed_idx with survivor_idx, then re-index
+        self.lines = [(survivor_idx if a == removed_idx else a,
+                        survivor_idx if b == removed_idx else b)
+                       for a, b in self.lines]
+        # Re-index: decrement indices > removed_idx
+        self.lines = [(a - 1 if a > removed_idx else a,
+                        b - 1 if b > removed_idx else b)
+                      for a, b in self.lines]
+        self.selected.clear()
+        self.status_changed.emit(
+            f"重合约束: 点#{removed_idx+1} → 点#{survivor_idx+1} ({target[0]:.1f}, {target[1]:.1f})"
+        )
         self.update()
         return True
 
     def is_profile_closed(self, tolerance_mm: float = 5.0) -> bool:
-        """Check if lines form a closed profile (start==end). Returns True if closed."""
+        """Check if lines form a closed profile (start==end)."""
         if not self.lines:
             return False
-        # Build adjacency graph
         from collections import defaultdict
         adj = defaultdict(list)
-        for i, ((x1, y1), (x2, y2)) in enumerate(self.lines):
-            adj[(x1, y1)].append((x2, y2, i))
-            adj[(x2, y2)].append((x1, y1, i))
-        # Simple check: if every endpoint has exactly 2 connections, it's closed
-        for pt, neighbors in adj.items():
-            if len(neighbors) != 2:
-                # Allow endpoints with 1 connection (open ends)
-                pass
-        # Check if there's a cycle
+        for i, (ia, ib) in enumerate(self.lines):
+            if ia >= len(self.points) or ib >= len(self.points):
+                continue
+            p1 = self.points[ia]
+            p2 = self.points[ib]
+            adj[p1].append((p2, i))
+            adj[p2].append((p1, i))
         if len(adj) < 2:
             return False
-        visited_pts = set()
+        visited = set()
         start = next(iter(adj))
-        # Walk the graph from start, see if we return
         stack = [start]
         while stack:
             pt = stack.pop()
-            if pt in visited_pts:
+            if pt in visited:
                 continue
-            visited_pts.add(pt)
-            for nxt, _, _ in adj[pt]:
-                if nxt not in visited_pts:
+            visited.add(pt)
+            for nxt, _ in adj[pt]:
+                if nxt not in visited:
                     stack.append(nxt)
-        # If all points visited in one component, profile is connected
-        # "Closed" means start point == end point within tolerance
         endpoints = [pt for pt, nbrs in adj.items() if len(nbrs) == 1]
         if len(endpoints) == 0:
-            # Fully closed — every point has degree 2
             return True
         if len(endpoints) == 2:
             d2 = (endpoints[0][0] - endpoints[1][0])**2 + (endpoints[0][1] - endpoints[1][1])**2
