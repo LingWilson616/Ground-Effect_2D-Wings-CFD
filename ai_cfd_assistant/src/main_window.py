@@ -137,17 +137,26 @@ class MainWindow(QMainWindow):
         cons1.setCheckable(True)
         cons2 = self.toolbar.addAction("🔒 固联约束")
         cons2.setCheckable(True)
-        cons1.triggered.connect(lambda: self._set_status("约束: 重合 (待实现)"))
-        cons2.triggered.connect(lambda: self._set_status("约束: 固联 (待实现)"))
+        cons1.triggered.connect(lambda: self._run_constraint("coincident"))
+        cons2.triggered.connect(lambda: self._run_constraint("rigid"))
 
         self.toolbar.hide()
 
     def _set_geo_tool(self, tool):
         if hasattr(self, 'geo_canvas'):
             self.geo_canvas.set_tool(tool)
-        # Uncheck all tool actions, then check the active one
         for t, a in self._geo_tool_actions.items():
             a.setChecked(t == tool)
+
+    def _run_constraint(self, constraint_type: str):
+        if constraint_type == "coincident":
+            ok = self.geo_canvas.coincident_constraint()
+            if not ok:
+                self._set_status("重合约束: 需先用选择工具 Ctrl+点击 选择2个点，然后点约束")
+            else:
+                self._set_status("重合约束已应用")
+        elif constraint_type == "rigid":
+            self._set_status("固联约束: 待实现")
 
     def _setup_central(self):
         central = QWidget()

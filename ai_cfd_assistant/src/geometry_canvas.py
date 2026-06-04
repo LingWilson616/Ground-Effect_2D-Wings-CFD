@@ -60,11 +60,12 @@ class InteractiveGeometryCanvas(QWidget):
         self._spline_finished = False
 
         # Selection & move state
-        self.selected = None  # ('point', index) or ('line', index) or ('spline', index)
+        self.selected = []  # list of ('type', index) for multi-select
         self._moving = False
         self._move_start_wx = 0.0
         self._move_start_wy = 0.0
         self._move_original_data = None
+        self._ctrl_held = False  # Ctrl for multi-select
 
         # Line drawing state
         self._line_start = None  # waiting for second point
@@ -91,8 +92,10 @@ class InteractiveGeometryCanvas(QWidget):
         self._airfoil_fill = QColor(31, 111, 235, 60)
         self._airfoil_stroke = QColor(31, 111, 235)
         self._point_color = QColor(220, 50, 50)
+        self._point_selected_color = QColor(243, 156, 18)
         self._line_preview = QColor(31, 111, 235, 150)
-        self._point_radius = 5.0
+        self._constr_color = QColor(63, 185, 80)       # green for constrained points
+        self._point_radius = 6.0
         self._initial_fit_done = False
 
         self._fit_to_widget()
@@ -154,6 +157,7 @@ class InteractiveGeometryCanvas(QWidget):
 
     def mousePressEvent(self, event: QMouseEvent):
         self._mouse_press_pos = event.position()
+        self._ctrl_held = bool(event.modifiers() & Qt.ControlModifier)
 
         if event.button() == Qt.LeftButton:
             self._pan_start_x = event.position().x()
@@ -165,7 +169,7 @@ class InteractiveGeometryCanvas(QWidget):
 
         elif event.button() == Qt.MiddleButton:
             self._fit_to_widget()
-            self.selected = None
+            self.selected.clear()
             self.status_changed.emit("视图已重置")
 
     def mouseMoveEvent(self, event: QMouseEvent):
@@ -174,14 +178,14 @@ class InteractiveGeometryCanvas(QWidget):
             dy = event.position().y() - self._pan_start_y
 
             if abs(dx) > self._drag_threshold or abs(dy) > self._drag_threshold:
-                # MOVE tool with a selected element: move the element
-                if self._current_tool == GeoTool.MOVE and self.selected is not None:
+                # MOVE tool with selected elements: move them
+                if self._current_tool == GeoTool.MOVE and self.selected:
                     if not self._moving:
                         self._moving = True
                         self._save_move_originals()
-                        wx, wy = self._widget_to_world(self._pan_start_x, self._pan_start_y)
-                        self._move_start_wx = wx
-                        self._move_start_wy = wy
+                        wx0, wy0 = self._widget_to_world(self._pan_start_x, self._pan_start_y)
+                        self._move_start_wx = wx0
+                        self._move_start_wy = wy0
                     wx, wy = self._widget_to_world(event.position().x(), event.position().y())
                     delta_wx = wx - self._move_start_wx
                     delta_wy = wy - self._move_start_wy
@@ -200,6 +204,24 @@ class InteractiveGeometryCanvas(QWidget):
         self.mouse_moved.emit(wx, wy)
         if self._line_start is not None:
             self.update()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            # Cancel current operation
+            if self._line_start is not None:
+                self._line_start = None
+                self.status_changed.emit("直线绘制已取消")
+            elif self._pending_points:
+                self._pending_points = []
+                self.status_changed.emit("样条线绘制已取消")
+            elif self.selected:
+                self.selected.clear()
+                self.status_changed.emit("已取消选中")
+            self._moving = False
+            self._panning = False
+            self.setCursor(Qt.ArrowCursor)
+            self.update()
+        super().keyPressEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent):
         if event.button() == Qt.LeftButton:
@@ -249,29 +271,28 @@ class InteractiveGeometryCanvas(QWidget):
         return best
 
     def _save_move_originals(self):
-        """Snapshot original data for move undo."""
-        sel_type, idx = self.selected
-        if sel_type == 'point':
-            self._move_original_data = list(self.points[idx])
-        elif sel_type == 'line':
-            p1, p2 = self.lines[idx]
-            self._move_original_data = [(p1[0], p1[1]), (p2[0], p2[1])]
-        elif sel_type == 'spline':
-            self._move_original_data = [list(p) for p in self.splines[idx]]
+        """Snapshot all selected elements before move."""
+        self._move_original_data = []
+        for sel_type, idx in self.selected:
+            if sel_type == 'point':
+                self._move_original_data.append(('point', idx, self.points[idx]))
+            elif sel_type == 'line':
+                p1, p2 = self.lines[idx]
+                self._move_original_data.append(('line', idx, (p1, p2)))
+            elif sel_type == 'spline':
+                self._move_original_data.append(('spline', idx, [(p[0], p[1]) for p in self.splines[idx]]))
 
     def _apply_move_delta(self, dx: float, dy: float):
-        """Apply translation delta to selected element."""
-        if self.selected is None:
-            return
-        sel_type, idx = self.selected
-        orig = self._move_original_data
-        if sel_type == 'point':
-            self.points[idx] = (orig[0] + dx, orig[1] + dy)
-        elif sel_type == 'line':
-            (x1, y1), (x2, y2) = orig
-            self.lines[idx] = ((x1 + dx, y1 + dy), (x2 + dx, y2 + dy))
-        elif sel_type == 'spline':
-            self.splines[idx] = [(px + dx, py + dy) for px, py in orig]
+        """Apply translation delta to all selected elements."""
+        for entry in self._move_original_data:
+            sel_type, idx, orig = entry
+            if sel_type == 'point':
+                self.points[idx] = (orig[0] + dx, orig[1] + dy)
+            elif sel_type == 'line':
+                (x1, y1), (x2, y2) = orig
+                self.lines[idx] = ((x1 + dx, y1 + dy), (x2 + dx, y2 + dy))
+            elif sel_type == 'spline':
+                self.splines[idx] = [(px + dx, py + dy) for px, py in orig]
 
     def mouseDoubleClickEvent(self, event: QMouseEvent):
         if event.button() == Qt.LeftButton and self._current_tool == GeoTool.SPLINE:
@@ -340,33 +361,39 @@ class InteractiveGeometryCanvas(QWidget):
         if tool == GeoTool.SELECT:
             elem = self._find_element_at(wx, wy)
             if elem is not None:
-                self.selected = elem
-                sel_type, idx = elem
-                if sel_type == 'point':
-                    px, py = self.points[idx]
-                    self.status_changed.emit(f"选中: 点 #{idx+1} ({px:.1f}, {py:.1f}) mm")
-                elif sel_type == 'line':
-                    (x1, y1), (x2, y2) = self.lines[idx]
-                    self.status_changed.emit(f"选中: 直线 #{idx+1} ({x1:.0f},{y1:.0f})→({x2:.0f},{y2:.0f})")
-                elif sel_type == 'spline':
-                    curve = self.splines[idx]
-                    self.status_changed.emit(f"选中: 样条线 #{idx+1} ({len(curve)} 点)")
+                if self._ctrl_held:
+                    # Multi-select: add to selection if not already there, remove if already there
+                    if elem in self.selected:
+                        self.selected.remove(elem)
+                    else:
+                        self.selected.append(elem)
+                    self.status_changed.emit(f"选中了 {len(self.selected)} 个元素 (Ctrl+点击切换)")
+                else:
+                    # Single select: replace
+                    self.selected = [elem]
+                    sel_type, idx = elem
+                    if sel_type == 'point':
+                        px, py = self.points[idx]
+                        self.status_changed.emit(f"选中: 点 #{idx+1} ({px:.1f}, {py:.1f}) mm — Ctrl+点击多选")
+                    elif sel_type == 'line':
+                        self.status_changed.emit(f"选中: 直线 #{idx+1}")
+                    elif sel_type == 'spline':
+                        self.status_changed.emit(f"选中: 样条线 #{idx+1}")
             else:
-                self.selected = None
+                self.selected.clear()
                 self.status_changed.emit("取消选中")
             self.update()
         elif tool == GeoTool.MOVE:
             elem = self._find_element_at(wx, wy)
             if elem is not None:
-                self.selected = elem
-                sel_type, idx = elem
-                if sel_type == 'point':
-                    px, py = self.points[idx]
-                    self.status_changed.emit(f"移动: 点 #{idx+1} — 拖动鼠标移动")
-                elif sel_type == 'line':
-                    self.status_changed.emit(f"移动: 直线 #{idx+1} — 拖动鼠标移动")
-                elif sel_type == 'spline':
-                    self.status_changed.emit(f"移动: 样条线 #{idx+1} — 拖动鼠标移动")
+                if self._ctrl_held:
+                    if elem in self.selected:
+                        self.selected.remove(elem)
+                    else:
+                        self.selected.append(elem)
+                else:
+                    self.selected = [elem]
+                self.status_changed.emit(f"移动: 已选中 {len(self.selected)} 个元素 — 拖动鼠标移动")
             self.update()
         elif tool == GeoTool.POINT:
             self.points.append((wx, wy))
@@ -694,42 +721,47 @@ class InteractiveGeometryCanvas(QWidget):
 
     def _draw_geometry_elements(self, p: QPainter):
         """Draw created points, lines, splines, and previews."""
-        highlight = QColor(243, 156, 18)       # orange
+        highlight = QColor(243, 156, 18)
         highlight_pen = QPen(highlight, 3)
         highlight_brush = QBrush(highlight)
-        radius = max(3.0, self._point_radius)
+        radius = max(4.0, self._point_radius)
+
+        # Build a set for quick "is selected" lookup
+        sel_set = set(self.selected)
 
         # Points
         for i, (wx, wy) in enumerate(self.points):
             px, py = self._world_to_widget(wx, wy)
-            is_sel = self.selected is not None and self.selected == ('point', i)
+            is_sel = ('point', i) in sel_set
             if is_sel:
-                p.setBrush(highlight_brush)
+                # Selected: orange ring + larger
                 p.setPen(highlight_pen)
-                p.drawEllipse(QPointF(px, py), radius + 3, radius + 3)
-                # Label
+                p.setBrush(Qt.NoBrush)
+                p.drawEllipse(QPointF(px, py), radius + 4, radius + 4)
+                p.setPen(QPen(highlight, 1))
                 font = QFont("Segoe UI", 7)
                 p.setFont(font)
-                p.setPen(QPen(highlight, 1))
-                p.drawText(int(px + 8), int(py - 8), f"点{i+1}")
-            p.setBrush(QBrush(self._point_color if not is_sel else highlight))
-            p.setPen(Qt.NoPen if not is_sel else highlight_pen)
+                p.drawText(int(px + 10), int(py - 10), f"点{i+1}")
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(highlight if is_sel else self._point_color))
             p.drawEllipse(QPointF(px, py), radius, radius)
 
         # Lines
         for i, ((x1, y1), (x2, y2)) in enumerate(self.lines):
-            is_sel = self.selected is not None and self.selected == ('line', i)
+            is_sel = ('line', i) in sel_set
             pen = highlight_pen if is_sel else QPen(QColor(30, 30, 30), 2.5 if is_sel else 1.5)
             p.setPen(pen)
+            p.setBrush(Qt.NoBrush)
             px1, py1 = self._world_to_widget(x1, y1)
             px2, py2 = self._world_to_widget(x2, y2)
             p.drawLine(int(px1), int(py1), int(px2), int(py2))
 
         # Completed splines
         for i, curve in enumerate(self.splines):
-            is_sel = self.selected is not None and self.selected == ('spline', i)
+            is_sel = ('spline', i) in sel_set
             pen = highlight_pen if is_sel else QPen(QColor(31, 111, 235), 2.5 if is_sel else 2)
             p.setPen(pen)
+            p.setBrush(Qt.NoBrush)
             for j in range(len(curve) - 1):
                 px1, py1 = self._world_to_widget(*curve[j])
                 px2, py2 = self._world_to_widget(*curve[j + 1])
@@ -781,7 +813,7 @@ class InteractiveGeometryCanvas(QWidget):
         self.lines.clear()
         self.splines.clear()
         self._pending_points = []
-        self.selected = None
+        self.selected.clear()
         self._moving = False
         self.clear_airfoil()
         self.update()
@@ -796,3 +828,60 @@ class InteractiveGeometryCanvas(QWidget):
 
     def screen_to_world(self, px: float, py: float) -> tuple[float, float]:
         return self._widget_to_world(px, py)
+
+    # ===== Constraint & profile operations =====
+
+    def coincident_constraint(self) -> bool:
+        """Snap two selected points together. Snaps 2nd to 1st."""
+        point_sels = [(t, i) for t, i in self.selected if t == 'point']
+        if len(point_sels) != 2:
+            self.status_changed.emit("重合约束需要恰好选中2个点 (Ctrl+点击多选)")
+            return False
+        _, i0 = point_sels[0]
+        _, i1 = point_sels[1]
+        target = self.points[i0]
+        self.points[i1] = target
+        self.status_changed.emit(f"重合约束: 点#{i1+1} → 点#{i0+1} ({target[0]:.1f}, {target[1]:.1f})")
+        self.update()
+        return True
+
+    def is_profile_closed(self, tolerance_mm: float = 5.0) -> bool:
+        """Check if lines form a closed profile (start==end). Returns True if closed."""
+        if not self.lines:
+            return False
+        # Build adjacency graph
+        from collections import defaultdict
+        adj = defaultdict(list)
+        for i, ((x1, y1), (x2, y2)) in enumerate(self.lines):
+            adj[(x1, y1)].append((x2, y2, i))
+            adj[(x2, y2)].append((x1, y1, i))
+        # Simple check: if every endpoint has exactly 2 connections, it's closed
+        for pt, neighbors in adj.items():
+            if len(neighbors) != 2:
+                # Allow endpoints with 1 connection (open ends)
+                pass
+        # Check if there's a cycle
+        if len(adj) < 2:
+            return False
+        visited_pts = set()
+        start = next(iter(adj))
+        # Walk the graph from start, see if we return
+        stack = [start]
+        while stack:
+            pt = stack.pop()
+            if pt in visited_pts:
+                continue
+            visited_pts.add(pt)
+            for nxt, _, _ in adj[pt]:
+                if nxt not in visited_pts:
+                    stack.append(nxt)
+        # If all points visited in one component, profile is connected
+        # "Closed" means start point == end point within tolerance
+        endpoints = [pt for pt, nbrs in adj.items() if len(nbrs) == 1]
+        if len(endpoints) == 0:
+            # Fully closed — every point has degree 2
+            return True
+        if len(endpoints) == 2:
+            d2 = (endpoints[0][0] - endpoints[1][0])**2 + (endpoints[0][1] - endpoints[1][1])**2
+            return d2 < tolerance_mm**2
+        return False
