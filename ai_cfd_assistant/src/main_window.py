@@ -14,6 +14,8 @@ from PySide6.QtWidgets import (
 )
 from .chat_widget import ChatWidget
 from .viz_widgets import VizPanel
+from .geometry_canvas import InteractiveGeometryCanvas
+from .region_canvas import RegionCanvas
 from .ai_client import AIClient
 from .theme import QSS
 
@@ -107,26 +109,30 @@ class MainWindow(QMainWindow):
         help_menu.addAction(about_action)
 
     def _setup_toolbar(self):
+        from .geometry_canvas import GeoTool
         self.toolbar = QToolBar("几何工具栏")
         self.toolbar.setMovable(False)
         self.toolbar.setIconSize(QSize(20, 20))
         self.addToolBar(Qt.TopToolBarArea, self.toolbar)
 
-        # Geometry tools
-        self.toolbar.addAction("📌 点", lambda: self._set_status("选择工具: 点"))
-        self.toolbar.addAction("📏 直线", lambda: self._set_status("选择工具: 直线"))
-        self.toolbar.addAction("〰️ 样条线", lambda: self._set_status("选择工具: 样条线"))
+        # Geometry creation tools
+        self.toolbar.addAction("📌 点", lambda: self._set_geo_tool(GeoTool.POINT))
+        self.toolbar.addAction("📏 直线", lambda: self._set_geo_tool(GeoTool.LINE))
+        self.toolbar.addAction("〰️ 样条线", lambda: self._set_geo_tool(GeoTool.SPLINE))
         self.toolbar.addSeparator()
-        self.toolbar.addAction("➕ 创建", lambda: self._set_status("几何操作: 创建"))
-        self.toolbar.addAction("🗑 删除", lambda: self._set_status("几何操作: 删除"))
-        self.toolbar.addAction("↔ 移动", lambda: self._set_status("几何操作: 移动"))
-        self.toolbar.addAction("🔄 旋转", lambda: self._set_status("几何操作: 旋转"))
-        self.toolbar.addAction("🔍 缩放", lambda: self._set_status("几何操作: 缩放"))
+        self.toolbar.addAction("➕ 创建", lambda: self._set_geo_tool(GeoTool.CREATE))
+        self.toolbar.addAction("🗑 删除", lambda: self._set_geo_tool(GeoTool.DELETE))
+        self.toolbar.addAction("↔ 移动", lambda: self._set_geo_tool(GeoTool.MOVE))
+        self.toolbar.addAction("🔍 选择", lambda: self._set_geo_tool(GeoTool.SELECT))
         self.toolbar.addSeparator()
-        self.toolbar.addAction("🔗 重合约束", lambda: self._set_status("约束: 重合"))
-        self.toolbar.addAction("🔒 固联约束", lambda: self._set_status("约束: 固联"))
+        self.toolbar.addAction("🔗 重合约束", lambda: self._set_status("约束: 重合 (待实现)"))
+        self.toolbar.addAction("🔒 固联约束", lambda: self._set_status("约束: 固联 (待实现)"))
 
-        self.toolbar.hide()  # Initially hidden, shown when geometry tab is active
+        self.toolbar.hide()
+
+    def _set_geo_tool(self, tool):
+        if hasattr(self, 'geo_canvas'):
+            self.geo_canvas.set_tool(tool)
 
     def _setup_central(self):
         central = QWidget()
@@ -181,33 +187,40 @@ class MainWindow(QMainWindow):
         self.workspace = QStackedWidget()
         self.workspace.setStyleSheet("background-color: #0d1117;")
 
-        # Geometry workspace — real canvas with grid
-        from .viz_widgets import MplCanvas
+        # Geometry workspace — interactive canvas
         self.geometry_workspace = QWidget()
         geo_layout = QVBoxLayout(self.geometry_workspace)
         geo_layout.setContentsMargins(0, 0, 0, 0)
         geo_layout.setSpacing(0)
 
-        self.geo_toolbar_label = QLabel("几何工具栏已激活 — 使用上方工具栏创建和编辑几何元素")
+        self.geo_toolbar_label = QLabel("左键拖动平移 | 滚轮缩放 | 右键点击创建点 | 上方工具栏选择工具")
         self.geo_toolbar_label.setStyleSheet(
             "color: #8b949e; font-size: 11px; padding: 6px 12px; background: #161b22; border-bottom: 1px solid #30363d;"
         )
         geo_layout.addWidget(self.geo_toolbar_label)
 
-        self.geo_canvas = MplCanvas(figsize=(8, 6))
-        self.geo_canvas.setStyleSheet("background-color: #e8e8e8; border: none;")
+        self.geo_canvas = InteractiveGeometryCanvas()
+        self.geo_canvas.mouse_moved.connect(self._on_geo_mouse_move)
+        self.geo_canvas.point_created.connect(self._on_geo_point_created)
+        self.geo_canvas.status_changed.connect(self._set_status)
         geo_layout.addWidget(self.geo_canvas, stretch=1)
-        self._draw_geometry_grid()
         self.workspace.addWidget(self.geometry_workspace)
 
-        # Region workspace
+        # Region workspace — flow domain with BCs
         self.region_workspace = QWidget()
         region_layout = QVBoxLayout(self.region_workspace)
         region_layout.setContentsMargins(0, 0, 0, 0)
-        region_label = QLabel("区域设置\n\n左侧: 速度进口\n右侧: 压力出口\n上侧: 壁面\n下侧: 壁面\n\n流体: 气体 | 分离流 | 恒密度 | 定常 | 湍流 k-ε")
-        region_label.setAlignment(Qt.AlignCenter)
-        region_label.setStyleSheet("background-color: #161b22; color: #8b949e; font-size: 14px; margin: 8px; border-radius: 4px;")
-        region_layout.addWidget(region_label)
+        region_layout.setSpacing(0)
+
+        region_header = QLabel("区域设置 — 边界条件与流体参数")
+        region_header.setStyleSheet(
+            "color: #c9d1d9; font-size: 12px; font-weight: 700; padding: 8px 12px; "
+            "background: #161b22; border-bottom: 1px solid #30363d;"
+        )
+        region_layout.addWidget(region_header)
+
+        self.region_canvas = RegionCanvas()
+        region_layout.addWidget(self.region_canvas, stretch=1)
         self.workspace.addWidget(self.region_workspace)
 
         # Mesh workspace
@@ -319,57 +332,24 @@ class MainWindow(QMainWindow):
     def _set_status(self, message: str):
         self.status_bar.showMessage(message)
 
+    def _on_geo_mouse_move(self, wx: float, wy: float):
+        """Update status bar with world coordinates."""
+        if 0 <= wx <= 3000 and 0 <= wy <= 2000:
+            self._set_status(f"X={wx:.1f} mm  Y={wy:.1f} mm")
+        else:
+            self._set_status("几何模块 — 左键拖动平移 | 滚轮缩放 | 右键创建点")
+
+    def _on_geo_point_created(self, wx: float, wy: float):
+        self._set_status(f"已创建点: ({wx:.1f}, {wy:.1f}) mm")
+
     # --- Menu actions ---
-
-    def _draw_geometry_grid(self, x=None, y=None, name=""):
-        """Draw the geometry canvas with 10mm grid and optional airfoil."""
-        self.geo_canvas.fig.clear()
-        ax = self.geo_canvas.fig.add_subplot(111)
-        ax.set_facecolor('#ececec')
-
-        # Grid (10mm units on 3000x2000 canvas → normalized to 0–3000, 0–2000)
-        ax.set_xlim(-50, 3050)
-        ax.set_ylim(-50, 2050)
-        ax.set_xticks(range(0, 3001, 100))
-        ax.set_yticks(range(0, 2001, 100))
-        ax.set_xticklabels([])
-        ax.set_yticklabels([])
-        ax.grid(True, color='#d0d0d0', linewidth=0.3)
-        # Major grid every 100mm
-        for spine in ax.spines.values():
-            spine.set_color('#aaaaaa')
-
-        # Coordinate axes
-        ax.arrow(50, 50, 200, 0, head_width=20, head_length=30, fc='#333333', ec='#333333', linewidth=1.5)
-        ax.arrow(50, 50, 0, 200, head_width=20, head_length=30, fc='#333333', ec='#333333', linewidth=1.5)
-        ax.text(270, 30, 'X', fontsize=12, fontweight='bold', color='#333333', ha='center')
-        ax.text(20, 270, 'Y', fontsize=12, fontweight='bold', color='#333333', va='center')
-        ax.text(30, 30, 'O', fontsize=10, color='#333333', ha='right', va='top')
-
-        # Scale label
-        ax.text(1500, -30, '3000 mm', fontsize=9, color='#888888', ha='center')
-        ax.text(-35, 1000, '2000 mm', fontsize=9, color='#888888', va='center', rotation=90)
-
-        # Draw airfoil if provided
-        if x is not None and y is not None:
-            # Scale airfoil to fit in center of canvas (chord ~1000mm)
-            scale = 1000.0
-            cx, cy = 1500, 1000
-            x_scaled = (x - 0.5) * scale + cx
-            y_scaled = y * scale + cy
-            ax.fill(x_scaled, y_scaled, color='#1f6feb', alpha=0.25, edgecolor='#1f6feb', linewidth=2)
-            title = f'{name}' if name else '导入翼型'
-            ax.set_title(title, fontsize=11, color='#333333', fontweight='bold', pad=10)
-
-        self.geo_canvas.fig.tight_layout(pad=0.5)
-        self.geo_canvas.draw()
 
     def _on_new(self):
         self.chat_widget.clear_chat()
         self.current_airfoil_data = None
         self.current_airfoil_name = "NACA 2412"
         self.current_result = None
-        self._draw_geometry_grid()
+        self.geo_canvas.clear_all()
         self.viz_panel.set_airfoil("2412")
         self._set_status("新项目已创建")
 
@@ -406,7 +386,9 @@ class MainWindow(QMainWindow):
         if np.mean(y_norm) < 0:
             y_norm = -y_norm
         # Update geometry canvas
-        self._draw_geometry_grid(x_norm, y_norm, self.current_airfoil_name)
+        self.geo_canvas.set_airfoil(x_norm, y_norm, self.current_airfoil_name)
+        # Update region canvas
+        self.region_canvas.set_airfoil(x_norm, y_norm, self.current_airfoil_name)
         # Update viz panels
         self.viz_panel.airfoil_panel.set_custom_airfoil(x_norm, y_norm, self.current_airfoil_name)
         self.viz_panel.pressure_panel.set_custom_airfoil(x_norm, y_norm, self.current_airfoil_name)
